@@ -328,8 +328,9 @@ def run_http_pipeline():
         # ---- ping / single-instance / quit ----
         s, d = http_json("GET", base + "/api/ping")
         check("ping 200 app marker", s == 200 and d.get("app") == "androdawg")
-        check("existing_instance detects self", A.existing_instance(base + "/") is True)
-        check("existing_instance false on dead port", A.existing_instance("http://127.0.0.1:1/") is False)
+        check("ping returns version", d.get("version") == A.VERSION)
+        check("instance_version detects self", A.instance_version(base + "/") == A.VERSION)
+        check("instance_version None on dead port", A.instance_version("http://127.0.0.1:1/") is None)
         real_exit = A.os._exit
         A.os._exit = lambda *a: None  # don't actually kill the test process
         try:

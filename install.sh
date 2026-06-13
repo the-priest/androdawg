@@ -12,7 +12,12 @@ RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 APP_DIR="$HOME/.androdawg"
 VENV="$APP_DIR/venv"
 BIN="$HOME/.local/bin"
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo .)"
+SELF="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF" ] && [ -f "$SELF" ]; then
+  SRC_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+else
+  SRC_DIR=""   # piped via curl|bash -> no local checkout, fetch from GitHub
+fi
 
 echo "[dawg] installing The Dawg // APK Forge"
 mkdir -p "$APP_DIR" "$BIN"

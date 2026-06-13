@@ -34,6 +34,8 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
+VERSION = "0.3"
+
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
 
@@ -468,6 +470,8 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -509,7 +513,7 @@ class H(BaseHTTPRequestHandler):
                 pass
             return
         if path == "/api/ping":
-            return self._send(200, {"app": "androdawg", "ok": True})
+            return self._send(200, {"app": "androdawg", "version": VERSION, "ok": True})
         if path == "/api/doctor":
             return self._send(200, {"checks": doctor()})
         if path == "/api/smoketest":
@@ -684,6 +688,7 @@ INDEX_HTML = r"""<!doctype html>
     box-shadow:0 0 10px var(--green)}
   header h1{font-size:15px;letter-spacing:2px;margin:0;font-weight:700}
   header h1 span{color:var(--cyan)}
+  header h1 .ver{color:var(--muted);font-size:10px;font-weight:400;letter-spacing:1px}
   header .sub{margin-left:auto;color:var(--muted);font-size:12px}
   main{max-width:1000px;margin:0 auto;padding:18px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
@@ -713,7 +718,7 @@ INDEX_HTML = r"""<!doctype html>
   .ok{color:var(--green);border-color:#1f4a1c}
   .bad{color:var(--danger);border-color:#5a1f1f}
   .warn{color:var(--amber);border-color:#5a4a1f}
-  .hidden{display:none}
+  .hidden{display:none !important}
   .gear{margin-left:12px;font-size:12px;padding:8px 12px}
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;
     align-items:center;justify-content:center;z-index:50}
@@ -745,7 +750,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="dot"></div>
-  <h1>THE DAWG <span>// APK FORGE</span></h1>
+  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.3</span></h1>
   <div class="sub" id="prov">describe an app &rarr; forge &rarr; build .apk</div>
   <button class="gear" id="gear" onclick="openSettings()">&#9881; settings</button>
   <button class="gear" id="quit" onclick="quitApp()">&#9211; quit</button>
@@ -795,7 +800,7 @@ INDEX_HTML = r"""<!doctype html>
     <pre id="log"></pre>
     <div class="row" style="margin-top:12px" id="dlrow"></div>
   </div>
-  <div class="overlay hidden" id="settings">
+  <div class="overlay hidden" id="settings" onclick="overlayClick(event)">
     <div class="modal">
       <h2>SETTINGS</h2>
       <div class="field">
@@ -1007,6 +1012,7 @@ async function openSettings(){
   document.getElementById('settings').classList.remove('hidden');
 }
 function closeSettings(){ document.getElementById('settings').classList.add('hidden'); }
+function overlayClick(e){ if(e.target && e.target.id==='settings'){ closeSettings(); } }
 async function saveSettings(){
   var sel = document.getElementById('sf_model_sel');
   var model = (sel.value==='__custom__') ? document.getElementById('sf_model_custom').value.trim() : sel.value;
@@ -1093,26 +1099,43 @@ def launch_app_window(url):
     return None
 
 
-def existing_instance(url):
-    """True if our app is already serving at url (single-instance guard)."""
+def instance_version(url):
+    """Return the version of a running instance at url, or None if none/ours-not-there."""
     try:
         with urllib.request.urlopen(url + "api/ping", timeout=0.7) as r:
             d = json.loads(r.read().decode())
-            return d.get("app") == "androdawg"
+            if d.get("app") == "androdawg":
+                return str(d.get("version", "?"))
     except Exception:
-        return False
+        pass
+    return None
+
+
+def _post_quit(url):
+    try:
+        req = urllib.request.Request(url + "api/quit", data=b"{}",
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
 
 
 def main():
     global CONFIG
     CONFIG = load_config()
     os.makedirs(PROJECTS, exist_ok=True)
-    # single instance: if we're already running, just open its window and exit
+    # single instance + auto-replace: if an instance is running, focus it when it's
+    # the same version, or tell it to quit and take over when it's older.
     probe = "http://%s:%s/" % (HOST, PORT)
-    if existing_instance(probe):
-        print("[dawg] already running -> focusing its window")
-        launch_app_window(probe)
-        return
+    running = instance_version(probe)
+    if running is not None:
+        if running == VERSION:
+            print("[dawg] already running (v%s) -> focusing its window" % running)
+            launch_app_window(probe)
+            return
+        print("[dawg] replacing older instance (v%s -> v%s)" % (running, VERSION))
+        _post_quit(probe)
+        time.sleep(1.2)  # let the old process release the port
     last_err = None
     srv = None
     for p in range(PORT, PORT + 12):
