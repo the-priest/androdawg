@@ -34,7 +34,7 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "0.5"
+VERSION = "0.7"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
@@ -116,7 +116,7 @@ HARD RULES
 - Make it actually fun/usable: sensible touch hitboxes, clear feedback, no dead UI.
 
 YOU ALSO DECLARE
-- requirements: comma list for Buildozer's `requirements` line. ALWAYS start with python3,kivy and append anything else you import that needs a recipe (pillow, requests, numpy, plyer). Stdlib-only needs nothing extra.
+- requirements: comma list for Buildozer's `requirements` line. ALWAYS start with python3,kivy. You may ONLY add packages from this exact set (they have python-for-android recipes): pillow, requests, certifi, urllib3, idna, plyer, numpy. NEVER put any other package name in requirements -- if the app would need something else, implement it with the Python stdlib or Kivy instead. Stdlib-only needs nothing beyond python3,kivy.
 - permissions: comma list of Android permissions (e.g. INTERNET, VIBRATE, RECORD_AUDIO, WRITE_EXTERNAL_STORAGE, CAMERA). Empty line if none.
 
 OUTPUT FORMAT - emit EXACTLY these sections in this order and NOTHING else (no prose before or after, no code fences):
@@ -144,6 +144,7 @@ package.name = {package}
 package.domain = org.thepriest
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas,ttf,wav,ogg,mp3,json
+source.exclude_dirs = .buildozer,bin,.git,__pycache__
 version = 1.0
 requirements = {requirements}
 orientation = {orientation}
@@ -164,6 +165,23 @@ warn_on_root = 1
 def slugify(s):
     s = re.sub(r"[^a-zA-Z0-9]+", "_", (s or "").strip()).strip("_").lower()
     return s or "app"
+
+
+def safe_package(name):
+    """A valid Android/Java package segment: [a-z][a-z0-9_]*, never leading digit."""
+    s = re.sub(r"[^a-z0-9_]", "", slugify(name)).strip("_")
+    if not s:
+        s = "app"
+    if s[0].isdigit():
+        s = "a" + s
+    return s
+
+
+def safe_title(t):
+    """Single-line title that can't break the .spec ini file."""
+    t = re.sub(r"[\r\n\t]+", " ", (t or "")).strip()
+    t = t.replace("[", "(").replace("]", ")")
+    return t[:60] or "App"
 
 
 def clean_perms(p):
@@ -225,8 +243,8 @@ def parse_sections(text):
 
 def make_spec(title, package, requirements, permissions, orientation):
     return SPEC_TEMPLATE.format(
-        title=title,
-        package=slugify(package),
+        title=safe_title(title),
+        package=safe_package(package),
         requirements=requirements,
         permissions=permissions,
         orientation=orientation,
@@ -439,7 +457,8 @@ def run_build(build_id, project_dir):
     log("(first build downloads the Android SDK/NDK and can take 20-40 min; later builds are minutes)")
     log("")
     try:
-        env = dict(os.environ, BUILDOZER_WARN_ON_ROOT="0", PYTHONUNBUFFERED="1")
+        env = dict(os.environ, BUILDOZER_WARN_ON_ROOT="0", PYTHONUNBUFFERED="1",
+                   PIP_BREAK_SYSTEM_PACKAGES="1")
         proc = subprocess.Popen(
             ["buildozer", "-v", "android", "debug"],
             cwd=project_dir,
@@ -676,13 +695,17 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": "buildozer not found on PATH. Run install.sh (or `pip install buildozer cython`), then retry."})
         project_dir = os.path.join(PROJECTS, name)
         os.makedirs(project_dir, exist_ok=True)
+        if body.get("clean"):
+            # wipe this project's local build cache (keeps the global SDK/NDK in ~/.buildozer)
+            shutil.rmtree(os.path.join(project_dir, ".buildozer"), ignore_errors=True)
         with open(os.path.join(project_dir, "main.py"), "w") as f:
             f.write(main_py)
         spec = make_spec(title, name, requirements, permissions, orientation)
         with open(os.path.join(project_dir, "buildozer.spec"), "w") as f:
             f.write(spec)
         bid = uuid.uuid4().hex[:12]
-        BUILDS[bid] = {"log": ["project: " + project_dir, ""], "status": "running", "apk": None}
+        first = "clean rebuild (project cache wiped)" if body.get("clean") else "project: " + project_dir
+        BUILDS[bid] = {"log": [first, ""], "status": "running", "apk": None}
         threading.Thread(target=run_build, args=(bid, project_dir), daemon=True).start()
         return self._send(200, {"build_id": bid, "project_dir": project_dir})
 
@@ -772,7 +795,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="dot"></div>
-  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.5</span></h1>
+  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.7</span></h1>
   <div class="sub" id="prov">describe an app &rarr; forge &rarr; build .apk</div>
   <button class="gear" id="gear" onclick="openSettings()">&#9881; settings</button>
   <button class="gear" id="quit" onclick="quitApp()">&#9211; quit</button>
@@ -812,6 +835,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="row" style="margin-top:14px">
       <button class="build" id="build" onclick="build()">BUILD APK</button>
       <button id="zip" onclick="downloadProject()">DOWNLOAD PROJECT (.zip)</button>
+      <label style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><input type="checkbox" id="clean"> clean rebuild</label>
       <span class="hint">first build pulls the SDK/NDK (~20-40 min); after that it's minutes.</span>
     </div>
   </div>
@@ -945,6 +969,7 @@ function render(d){
 async function build(){
   if(!cur || working || cur.hardFail){ return; }
   cur.main_py = document.getElementById('code').value;  // build the possibly-edited code
+  cur.clean = document.getElementById('clean').checked;
   working=true; refreshButtons();
   document.getElementById('buildwrap').classList.remove('hidden');
   document.getElementById('dlrow').innerHTML='';
@@ -1145,6 +1170,12 @@ def _post_quit(url):
 def main():
     global CONFIG
     CONFIG = load_config()
+    # make sure user-site bin (where buildozer installs) is found, and allow pip to
+    # install into an externally-managed env (Kali / PEP 668) during the build
+    local_bin = os.path.expanduser("~/.local/bin")
+    if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = local_bin + os.pathsep + os.environ.get("PATH", "")
+    os.environ.setdefault("PIP_BREAK_SYSTEM_PACKAGES", "1")
     os.makedirs(PROJECTS, exist_ok=True)
     # single instance + auto-replace: if an instance is running, focus it when it's
     # the same version, or tell it to quit and take over when it's older.

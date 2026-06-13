@@ -10,7 +10,6 @@ BRANCH="main"
 
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 APP_DIR="$HOME/.androdawg"
-VENV="$APP_DIR/venv"
 BIN="$HOME/.local/bin"
 SELF="${BASH_SOURCE[0]:-}"
 if [ -n "$SELF" ] && [ -f "$SELF" ]; then
@@ -48,12 +47,13 @@ else
   echo "[dawg] non-apt distro - ensure equivalents are installed: $SYS_COMMON + a JDK"
 fi
 
-# 2) buildozer venv (keeps cython/buildozer off the system python)
-echo "[dawg] creating buildozer venv at $VENV ..."
-python3 -m venv "$VENV"
-"$VENV/bin/pip" install --upgrade pip wheel >/dev/null
-echo "[dawg] installing buildozer + cython (pinned) ..."
-"$VENV/bin/pip" install "cython==0.29.36" buildozer
+# 2) buildozer + cython into the USER site (NOT a venv).
+# python-for-android runs `pip install --user` for its host build tools, which
+# fails inside any virtualenv ("user site-packages are not visible"). So we install
+# to ~/.local and let pip write to the externally-managed (Kali/PEP 668) env.
+echo "[dawg] installing buildozer + cython (pinned) into ~/.local ..."
+python3 -m pip install --user --break-system-packages --upgrade pip wheel >/dev/null 2>&1 || true
+python3 -m pip install --user --break-system-packages "cython==0.29.36" buildozer
 
 # 3) fetch the forge (local copy if running from the cloned repo, else download)
 if [ -f "$SRC_DIR/apkforge.py" ]; then
@@ -64,10 +64,12 @@ else
   curl -fsSL "$RAW/apkforge.py" -o "$APP_DIR/apkforge.py"
 fi
 
-# 4) launcher: venv on PATH so 'buildozer' resolves, run the stdlib server
+# 4) launcher: user-site bin on PATH so 'buildozer' resolves under system python
+# (user site visible), and let p4a's pip installs write to the Kali/PEP 668 env.
 cat > "$BIN/androdawg" <<EOF
 #!/usr/bin/env bash
-export PATH="$VENV/bin:\$PATH"
+export PATH="\$HOME/.local/bin:\$PATH"
+export PIP_BREAK_SYSTEM_PACKAGES=1
 exec python3 "$APP_DIR/apkforge.py" "\$@"
 EOF
 chmod +x "$BIN/androdawg"

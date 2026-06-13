@@ -7,6 +7,7 @@ so the tool's logic can be proven without API keys or a real Android toolchain.
 Run: python3 selftest.py
 """
 import os
+import re
 import sys
 import json
 import time
@@ -107,6 +108,29 @@ CASES.append(("junk_orientation",
 # 15. huge code blob
 CASES.append(("huge_code",
     "<<<MAIN_PY>>>\n" + GOOD_APP + ("# pad\n" * 5000) + "<<<END>>>", True, False))
+
+
+def run_spec_tests():
+    print("[1c] package/title sanitizers + spec")
+    pkg = [
+        ("3d game", "a3d_game"),
+        ("garry_is_gay", "garry_is_gay"),
+        ("My Cool App!!", "my_cool_app"),
+        ("", "app"),
+        ("123", "a123"),
+        ("___", "app"),
+    ]
+    for inp, exp in pkg:
+        got = A.safe_package(inp)
+        check("safe_package(%r)==%r" % (inp, exp), got == exp)
+    check("safe_title strips newlines", "\n" not in A.safe_title("a\nb"))
+    check("safe_title strips brackets", "[" not in A.safe_title("x[y]"))
+    check("safe_title length cap", len(A.safe_title("z" * 200)) <= 60)
+    spec = A.make_spec("3D Blaster!", "3D Blaster!", "python3,kivy", "INTERNET", "portrait")
+    check("spec package.name valid (no leading digit)",
+          re.search(r"(?m)^package\.name = [a-z_][a-z0-9_]*$", spec) is not None)
+    check("spec has exclude_dirs", "source.exclude_dirs" in spec)
+    check("spec single-line title", spec.count("\ntitle = ") == 1)
 
 
 def run_url_tests():
@@ -423,6 +447,7 @@ if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200000
     run_parser_cases()
     run_url_tests()
+    run_spec_tests()
     hammer_parser(n)
     run_http_pipeline()
     run_buildozer_missing_path()
