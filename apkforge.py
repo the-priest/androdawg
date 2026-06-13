@@ -34,7 +34,7 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "0.3"
+VERSION = "0.4"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
@@ -353,11 +353,31 @@ SMOKE_TEXT = (
 
 
 # ----------------------------------------------------------------- AI
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+
+
+def chat_url(base):
+    """Normalize a base/endpoint into a full /chat/completions URL."""
+    u = (base or "").strip().rstrip("/")
+    if not u:
+        return SF_URL
+    if u.endswith("/chat/completions"):
+        return u
+    if not u.endswith("/v1") and "/v1/" not in u and "/v1" not in u:
+        u += "/v1"
+    return u + "/chat/completions"
+
+
 def _post_json(url, key, payload):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": UA,  # bare urllib UA gets Cloudflare-1010 blocked (e.g. Groq)
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=240) as r:
@@ -369,8 +389,9 @@ def call_ai(messages):
     gq = groq_key()
     errs = []
     if sf:
+        sf_u = chat_url(CONFIG.get("sf_url") or SF_URL)
         try:
-            d = _post_json(CONFIG.get("sf_url") or SF_URL, sf, {
+            d = _post_json(sf_u, sf, {
                 "model": CONFIG.get("sf_model") or SF_MODEL, "messages": messages,
                 "temperature": 0.4, "max_tokens": 8192,
             })
@@ -380,12 +401,13 @@ def call_ai(messages):
                 body = e.read().decode("utf-8")[:300]
             except Exception:
                 body = ""
-            errs.append("SiliconFlow %s: %s" % (e.code, body))
+            errs.append("SiliconFlow %s at %s: %s" % (e.code, sf_u, body))
         except Exception as e:
-            errs.append("SiliconFlow: %s" % e)
+            errs.append("SiliconFlow (%s): %s" % (sf_u, e))
     if gq:
+        gq_u = chat_url(CONFIG.get("groq_url") or GROQ_URL)
         try:
-            d = _post_json(CONFIG.get("groq_url") or GROQ_URL, gq, {
+            d = _post_json(gq_u, gq, {
                 "model": CONFIG.get("groq_model") or GROQ_MODEL, "messages": messages,
                 "temperature": 0.4, "max_tokens": 8192,
             })
@@ -567,12 +589,12 @@ class H(BaseHTTPRequestHandler):
             CONFIG["groq_key"] = body["groq_key"].strip()
         if (body.get("sf_model") or "").strip():
             CONFIG["sf_model"] = body["sf_model"].strip()
-        if (body.get("sf_url") or "").strip():
-            CONFIG["sf_url"] = body["sf_url"].strip()
+        if "sf_url" in body:
+            CONFIG["sf_url"] = (body.get("sf_url") or "").strip() or SF_URL
         if (body.get("groq_model") or "").strip():
             CONFIG["groq_model"] = body["groq_model"].strip()
-        if (body.get("groq_url") or "").strip():
-            CONFIG["groq_url"] = body["groq_url"].strip()
+        if "groq_url" in body:
+            CONFIG["groq_url"] = (body.get("groq_url") or "").strip() or GROQ_URL
         ok = save_config(CONFIG)
         return self._send(200, {
             "saved": ok,
@@ -750,7 +772,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="dot"></div>
-  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.3</span></h1>
+  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.4</span></h1>
   <div class="sub" id="prov">describe an app &rarr; forge &rarr; build .apk</div>
   <button class="gear" id="gear" onclick="openSettings()">&#9881; settings</button>
   <button class="gear" id="quit" onclick="quitApp()">&#9211; quit</button>

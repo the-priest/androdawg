@@ -109,6 +109,23 @@ CASES.append(("huge_code",
     "<<<MAIN_PY>>>\n" + GOOD_APP + ("# pad\n" * 5000) + "<<<END>>>", True, False))
 
 
+def run_url_tests():
+    print("[1b] chat_url normalization")
+    cases = [
+        ("https://api.siliconflow.cn/v1/chat/completions", "https://api.siliconflow.cn/v1/chat/completions"),
+        ("https://api.siliconflow.cn/v1", "https://api.siliconflow.cn/v1/chat/completions"),
+        ("https://api.siliconflow.cn/v1/", "https://api.siliconflow.cn/v1/chat/completions"),
+        ("https://api.siliconflow.cn", "https://api.siliconflow.cn/v1/chat/completions"),
+        ("https://api.groq.com/openai/v1/chat/completions", "https://api.groq.com/openai/v1/chat/completions"),
+        ("https://api.groq.com/openai/v1", "https://api.groq.com/openai/v1/chat/completions"),
+        ("", A.SF_URL),
+        ("   ", A.SF_URL),
+    ]
+    for inp, exp in cases:
+        got = A.chat_url(inp)
+        check("chat_url(%r)==%r" % (inp, exp), got == exp)
+
+
 def run_parser_cases():
     print("[1] parser/validator adversarial cases")
     for label, text, exp_ok, exp_err in CASES:
@@ -405,6 +422,7 @@ def run_buildozer_missing_path():
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200000
     run_parser_cases()
+    run_url_tests()
     hammer_parser(n)
     run_http_pipeline()
     run_buildozer_missing_path()
