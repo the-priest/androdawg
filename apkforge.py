@@ -34,7 +34,7 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "0.4"
+VERSION = "0.5"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
@@ -772,7 +772,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="dot"></div>
-  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.4</span></h1>
+  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.5</span></h1>
   <div class="sub" id="prov">describe an app &rarr; forge &rarr; build .apk</div>
   <button class="gear" id="gear" onclick="openSettings()">&#9881; settings</button>
   <button class="gear" id="quit" onclick="quitApp()">&#9211; quit</button>
@@ -875,7 +875,7 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 
 <script>
-var history = [];
+var convo = [];
 var cur = null;
 var poll = null;
 var working = false;
@@ -896,13 +896,13 @@ async function forge(text){
   working=true; refreshButtons(); setHint('forging ...');
   try{
     var r = await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({description:desc, history:history})});
+      body:JSON.stringify({description:desc, history:convo})});
     var d = await r.json();
     if(!r.ok || d.error){ alert('forge error: ' + (d.error||r.status)); }
     else if(!d.ok){ alert(d.error||'no code produced'); }
     else {
-      history.push({role:'user',content:desc});
-      history.push({role:'assistant',content:d.raw});
+      convo.push({role:'user',content:desc});
+      convo.push({role:'assistant',content:d.raw});
       cur = d; render(d);
     }
   }catch(e){ alert('network: ' + e); }
@@ -917,7 +917,7 @@ async function smoke(){
   try{
     var r = await fetch('/api/smoketest');
     var d = await r.json();
-    history = []; cur = d; render(d);
+    convo = []; cur = d; render(d);
   }catch(e){ alert('smoke: ' + e); }
   setHint(''); working=false; refreshButtons();
 }
