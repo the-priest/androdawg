@@ -724,6 +724,10 @@ INDEX_HTML = r"""<!doctype html>
     color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:10px;
     font-family:inherit;font-size:13px;margin-bottom:4px}
   .modal .field{margin-bottom:14px}
+  .modal select{width:100%;background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line);border-radius:8px;padding:10px;font-family:inherit;font-size:13px}
+  .modal .adv{margin:2px 0 8px;border-top:1px solid var(--line);padding-top:10px}
+  .modal .adv summary{cursor:pointer;color:var(--muted);font-size:12px;letter-spacing:1px}
   .modal .sub2{color:var(--muted);font-size:11px;letter-spacing:0}
   .modal .clr{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:11px;margin-top:4px}
   .hint{color:var(--muted);font-size:12px;margin-top:8px}
@@ -796,23 +800,45 @@ INDEX_HTML = r"""<!doctype html>
       <h2>SETTINGS</h2>
       <div class="field">
         <label>SILICONFLOW API KEY <span class="sub2" id="sfset"></span></label>
-        <input id="sf_key" type="password" placeholder="paste key (blank = keep current)" autocomplete="off">
+        <input id="sf_key" type="password" placeholder="paste your key here" autocomplete="off">
         <div class="clr"><input type="checkbox" id="clear_sf"> clear stored key</div>
       </div>
       <div class="field">
-        <label>SILICONFLOW MODEL</label>
-        <input id="sf_model" type="text" autocomplete="off">
+        <label>MODEL</label>
+        <select id="sf_model_sel" onchange="onModelChange()">
+          <option value="deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash (default)</option>
+          <option value="deepseek-ai/DeepSeek-V3.2">DeepSeek-V3.2</option>
+          <option value="deepseek-ai/DeepSeek-V3.1-Terminus">DeepSeek-V3.1-Terminus</option>
+          <option value="zai-org/GLM-4.6">GLM-4.6</option>
+          <option value="Qwen/Qwen3-32B">Qwen3-32B</option>
+          <option value="Qwen/Qwen3-30B-A3B">Qwen3-30B-A3B</option>
+          <option value="Qwen/Qwen3.5-35B-A3B">Qwen3.5-35B-A3B</option>
+          <option value="tencent/Hunyuan-A13B-Instruct">Hunyuan-A13B-Instruct</option>
+          <option value="__custom__">Custom...</option>
+        </select>
+        <input id="sf_model_custom" type="text" class="hidden" placeholder="exact model id, e.g. deepseek-ai/DeepSeek-R1" style="margin-top:6px" autocomplete="off">
       </div>
       <div class="field">
-        <label>SILICONFLOW BASE URL</label>
-        <input id="sf_url" type="text" autocomplete="off">
-      </div>
-      <div class="field">
-        <label>GROQ API KEY (fallback) <span class="sub2" id="gqset"></span></label>
-        <input id="groq_key" type="password" placeholder="paste key (blank = keep current)" autocomplete="off">
+        <label>GROQ API KEY <span class="sub2">fallback, optional</span> <span class="sub2" id="gqset"></span></label>
+        <input id="groq_key" type="password" placeholder="optional" autocomplete="off">
         <div class="clr"><input type="checkbox" id="clear_groq"> clear stored key</div>
       </div>
-      <div class="row" style="margin-top:6px">
+      <details class="adv">
+        <summary>Advanced (you don't need to touch these)</summary>
+        <div class="field" style="margin-top:10px">
+          <label>SILICONFLOW BASE URL</label>
+          <input id="sf_url" type="text" value="https://api.siliconflow.cn/v1/chat/completions" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>GROQ MODEL</label>
+          <input id="groq_model" type="text" value="llama-3.3-70b-versatile" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>GROQ BASE URL</label>
+          <input id="groq_url" type="text" value="https://api.groq.com/openai/v1/chat/completions" autocomplete="off">
+        </div>
+      </details>
+      <div class="row" style="margin-top:12px">
         <button class="primary" onclick="saveSettings()">SAVE</button>
         <button onclick="closeSettings()">CANCEL</button>
         <span class="hint" id="setmsg"></span>
@@ -952,26 +978,45 @@ async function loadDoctor(){
   }
 }
 
+function onModelChange(){
+  var sel = document.getElementById('sf_model_sel');
+  var cust = document.getElementById('sf_model_custom');
+  if(sel.value === '__custom__'){ cust.classList.remove('hidden'); cust.focus(); }
+  else { cust.classList.add('hidden'); }
+}
+
 async function openSettings(){
   try{
     var r = await fetch('/api/config'); var d = await r.json();
-    document.getElementById('sf_model').value = d.sf_model||'';
-    document.getElementById('sf_url').value = d.sf_url||'';
+    var sel = document.getElementById('sf_model_sel');
+    var cust = document.getElementById('sf_model_custom');
+    var m = d.sf_model || 'deepseek-ai/DeepSeek-V4-Flash';
+    var found = false;
+    for(var i=0;i<sel.options.length;i++){ if(sel.options[i].value===m){ found=true; break; } }
+    if(found){ sel.value=m; cust.classList.add('hidden'); cust.value=''; }
+    else { sel.value='__custom__'; cust.classList.remove('hidden'); cust.value=m; }
+    if(d.sf_url){ document.getElementById('sf_url').value=d.sf_url; }
+    if(d.groq_model){ document.getElementById('groq_model').value=d.groq_model; }
+    if(d.groq_url){ document.getElementById('groq_url').value=d.groq_url; }
     document.getElementById('sf_key').value=''; document.getElementById('groq_key').value='';
     document.getElementById('clear_sf').checked=false; document.getElementById('clear_groq').checked=false;
     document.getElementById('sfset').textContent = d.sf_key_set ? '(stored)' : (d.sf_env ? '(from env)' : '(not set)');
-    document.getElementById('gqset').textContent = d.groq_key_set ? '(stored)' : (d.groq_env ? '(from env)' : '(not set)');
+    document.getElementById('gqset').textContent = d.groq_key_set ? '(stored)' : (d.groq_env ? '(from env)' : '');
     document.getElementById('setmsg').textContent='';
   }catch(e){}
   document.getElementById('settings').classList.remove('hidden');
 }
 function closeSettings(){ document.getElementById('settings').classList.add('hidden'); }
 async function saveSettings(){
+  var sel = document.getElementById('sf_model_sel');
+  var model = (sel.value==='__custom__') ? document.getElementById('sf_model_custom').value.trim() : sel.value;
   var body = {
     sf_key: document.getElementById('sf_key').value,
     groq_key: document.getElementById('groq_key').value,
-    sf_model: document.getElementById('sf_model').value,
+    sf_model: model,
     sf_url: document.getElementById('sf_url').value,
+    groq_model: document.getElementById('groq_model').value,
+    groq_url: document.getElementById('groq_url').value,
     clear_sf: document.getElementById('clear_sf').checked,
     clear_groq: document.getElementById('clear_groq').checked
   };

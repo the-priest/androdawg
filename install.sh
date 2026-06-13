@@ -18,17 +18,29 @@ echo "[dawg] installing The Dawg // APK Forge"
 mkdir -p "$APP_DIR" "$BIN"
 
 # 1) system build deps (best-effort; needs sudo)
-SYS="git zip unzip openjdk-17-jdk python3 python3-pip python3-venv autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache"
+# non-java deps install individually so one missing/renamed package can't sink the rest
+SYS_COMMON="git zip unzip python3 python3-pip python3-venv autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache"
+# JDK name differs across distros/Kali rolling -- first one that installs wins
+JAVA_PREF="openjdk-17-jdk openjdk-21-jdk default-jdk openjdk-jdk"
 if command -v apt-get >/dev/null 2>&1; then
   if command -v sudo >/dev/null 2>&1; then
     echo "[dawg] installing system deps via apt (sudo)..."
     sudo apt-get update -y || true
-    sudo apt-get install -y $SYS || echo "[dawg] WARN: apt failed; install these yourself: $SYS"
+    for p in $SYS_COMMON; do
+      sudo apt-get install -y "$p" >/dev/null 2>&1 || echo "[dawg] WARN: could not install $p"
+    done
+    jdk_ok=0
+    for j in $JAVA_PREF; do
+      if sudo apt-get install -y "$j" >/dev/null 2>&1; then
+        echo "[dawg] JDK installed: $j"; jdk_ok=1; break
+      fi
+    done
+    [ "$jdk_ok" = "1" ] || echo "[dawg] WARN: no JDK installed -- install one of: $JAVA_PREF"
   else
-    echo "[dawg] no sudo - install these yourself: $SYS"
+    echo "[dawg] no sudo - install yourself: $SYS_COMMON + a JDK ($JAVA_PREF)"
   fi
 else
-  echo "[dawg] non-apt distro - ensure equivalents are installed: $SYS"
+  echo "[dawg] non-apt distro - ensure equivalents are installed: $SYS_COMMON + a JDK"
 fi
 
 # 2) buildozer venv (keeps cython/buildozer off the system python)
