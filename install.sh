@@ -50,7 +50,7 @@ if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
   # 2b) JDK 17 — REQUIRED. Kali ships no openjdk-17, and its default JDK (21/25) breaks
   # buildozer's bundled Gradle ("Unsupported class file major version"). Get Temurin 17
   # by apt, else by tarball. Always lands in /usr/lib/jvm so the app auto-detects it.
-  jdk17_present() { ls -d /usr/lib/jvm/temurin-17-jdk* /usr/lib/jvm/java-17-openjdk* >/dev/null 2>&1; }
+  jdk17_present() { for d in /usr/lib/jvm/temurin-17-jdk* /usr/lib/jvm/java-17-openjdk*; do [ -x "$d/bin/java" ] && return 0; done; return 1; }
   # heal any broken adoptium repo a previous run may have written (wrong suite -> 404)
   sudo rm -f /etc/apt/sources.list.d/adoptium.list /etc/apt/keyrings/adoptium.gpg 2>/dev/null || true
   if jdk17_present; then
