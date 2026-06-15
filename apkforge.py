@@ -5,12 +5,13 @@ Describe an Android app -> forge a complete single-file Kivy app -> compile to a
 real .apk with Buildozer, all locally on this machine.
 
 Stdlib-only server + browser UI. SiliconFlow/DeepSeek-V4-Flash primary, Groq fallback.
-Keys come from env: SILICONFLOW_API_KEY (primary), GROQ_API_KEY (fallback).
+Keys are set in the in-app Settings (gear) or via env (SILICONFLOW_API_KEY / GROQ_API_KEY).
 """
 
 import os
 import re
 import io
+import glob
 import json
 import uuid
 import time
@@ -34,7 +35,7 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "0.7"
+VERSION = "1.0"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
@@ -167,13 +168,25 @@ def slugify(s):
     return s or "app"
 
 
+JAVA_RESERVED = {
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+    "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
+    "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
+    "interface", "long", "native", "new", "package", "private", "protected", "public",
+    "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this",
+    "throw", "throws", "transient", "try", "void", "volatile", "while", "true", "false", "null",
+}
+
+
 def safe_package(name):
-    """A valid Android/Java package segment: [a-z][a-z0-9_]*, never leading digit."""
+    """A valid Android/Java package segment: [a-z][a-z0-9_]*, never a digit-start or keyword."""
     s = re.sub(r"[^a-z0-9_]", "", slugify(name)).strip("_")
     if not s:
         s = "app"
     if s[0].isdigit():
         s = "a" + s
+    if s in JAVA_RESERVED:
+        s = s + "_app"
     return s
 
 
@@ -317,11 +330,46 @@ def build_forge_payload(text, desc):
     }
 
 
+def java_version():
+    """(version_string, major_int) for the java that will run Gradle, or (None, None)."""
+    jh = os.environ.get("JAVA_HOME", "")
+    java = os.path.join(jh, "bin", "java") if jh else ""
+    if not (java and os.path.exists(java)):
+        java = shutil.which("java") or ""
+    if not java:
+        return None, None
+    try:
+        out = subprocess.run([java, "-version"], capture_output=True, text=True, timeout=10)
+        txt = (out.stderr or "") + (out.stdout or "")
+    except Exception:
+        return None, None
+    m = re.search(r'version "(\d+)(?:\.(\d+))?', txt)
+    if not m:
+        return None, None
+    major = int(m.group(1))
+    if major == 1 and m.group(2):  # legacy 1.8.0 scheme
+        major = int(m.group(2))
+    full = re.search(r'version "([^"]+)"', txt)
+    return (full.group(1) if full else str(major)), major
+
+
+# Buildozer's bundled Gradle (8.x) runs on JDK 17-24; JDK 25+ (class file major 69)
+# crashes it. 17 is the safe target.
+GRADLE_JDK_MIN = 17
+GRADLE_JDK_MAX = 24
+
+
 def doctor():
     """Toolchain self-diagnosis so failures are seen before a build is started."""
     checks = []
     checks.append(["buildozer", shutil.which("buildozer") is not None])
-    checks.append(["java", (shutil.which("javac") is not None) or (shutil.which("java") is not None)])
+    jver, jmaj = java_version()
+    if jmaj is None:
+        checks.append(["java (none) - install JDK 17", False])
+    elif GRADLE_JDK_MIN <= jmaj <= GRADLE_JDK_MAX:
+        checks.append(["java %s" % jver, True])
+    else:
+        checks.append(["java %s - Gradle needs JDK 17" % jver, False])
     checks.append(["git", shutil.which("git") is not None])
     checks.append(["zip", shutil.which("zip") is not None])
     checks.append(["unzip", shutil.which("unzip") is not None])
@@ -379,9 +427,11 @@ def chat_url(base):
     u = (base or "").strip().rstrip("/")
     if not u:
         return SF_URL
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "https://" + u
     if u.endswith("/chat/completions"):
         return u
-    if not u.endswith("/v1") and "/v1/" not in u and "/v1" not in u:
+    if "/v1" not in u:
         u += "/v1"
     return u + "/chat/completions"
 
@@ -446,15 +496,28 @@ def call_ai(messages):
 # ----------------------------------------------------------------- build
 def run_build(build_id, project_dir):
     rec = BUILDS[build_id]
+    logpath = os.path.join(project_dir, "build.log")
+    try:
+        logf = open(logpath, "w")
+    except Exception:
+        logf = None
+    rec["logfile"] = logpath
 
     def log(line):
         rec["log"].append(line)
         if len(rec["log"]) > 6000:
             del rec["log"][:1500]
+        if logf:
+            try:
+                logf.write(line + "\n")
+                logf.flush()
+            except Exception:
+                pass
 
     log("$ cd " + project_dir)
     log("$ buildozer -v android debug")
     log("(first build downloads the Android SDK/NDK and can take 20-40 min; later builds are minutes)")
+    log("full log saved to: " + logpath)
     log("")
     try:
         env = dict(os.environ, BUILDOZER_WARN_ON_ROOT="0", PYTHONUNBUFFERED="1",
@@ -489,13 +552,19 @@ def run_build(build_id, project_dir):
         else:
             rec["status"] = "failed"
             log("")
-            log("buildozer exited with code %s" % proc.returncode)
+            log("buildozer exited with code %s (full log: %s)" % (proc.returncode, logpath))
     except FileNotFoundError:
         rec["status"] = "failed"
-        log("ERROR: buildozer not found on PATH. Install it (see README) and retry.")
+        log("ERROR: buildozer not found on PATH. Run install.sh, then retry.")
     except Exception as e:
         rec["status"] = "failed"
         log("ERROR: %s" % e)
+    finally:
+        if logf:
+            try:
+                logf.close()
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------- server
@@ -693,6 +762,13 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": "won't build: " + "; ".join(errors)})
         if shutil.which("buildozer") is None:
             return self._send(400, {"error": "buildozer not found on PATH. Run install.sh (or `pip install buildozer cython`), then retry."})
+        jver, jmaj = java_version()
+        if jmaj is not None and not (GRADLE_JDK_MIN <= jmaj <= GRADLE_JDK_MAX):
+            return self._send(400, {"error":
+                "Java %s is active, but Buildozer's Gradle needs JDK 17. The build would "
+                "run for ages then die at the Gradle step. Fix: sudo apt install -y "
+                "openjdk-17-jdk  then relaunch The Dawg (it uses JDK 17 automatically once "
+                "installed)." % jver})
         project_dir = os.path.join(PROJECTS, name)
         os.makedirs(project_dir, exist_ok=True)
         if body.get("clean"):
@@ -795,7 +871,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="dot"></div>
-  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v0.7</span></h1>
+  <h1>THE DAWG <span>// APK FORGE</span> <span class="ver">v1.0</span></h1>
   <div class="sub" id="prov">describe an app &rarr; forge &rarr; build .apk</div>
   <button class="gear" id="gear" onclick="openSettings()">&#9881; settings</button>
   <button class="gear" id="quit" onclick="quitApp()">&#9211; quit</button>
@@ -1176,6 +1252,17 @@ def main():
     if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = local_bin + os.pathsep + os.environ.get("PATH", "")
     os.environ.setdefault("PIP_BREAK_SYSTEM_PACKAGES", "1")
+    # Force JDK 17 for the build if one is installed. Buildozer's bundled Gradle can't
+    # run on JDK 25+ (Kali's default), so we point JAVA_HOME at 17 regardless of the
+    # system default. If no 17 is present, the doctor + preflight will flag it.
+    for pat in ("/usr/lib/jvm/temurin-17-jdk*", "/usr/lib/jvm/java-17-openjdk*",
+                "/usr/lib/jvm/*-17-*", "/usr/lib/jvm/*17*"):
+        hits = sorted(p for p in glob.glob(pat)
+                      if os.path.isdir(p) and os.path.exists(os.path.join(p, "bin", "java")))
+        if hits:
+            os.environ["JAVA_HOME"] = hits[0]
+            os.environ["PATH"] = os.path.join(hits[0], "bin") + os.pathsep + os.environ.get("PATH", "")
+            break
     os.makedirs(PROJECTS, exist_ok=True)
     # single instance + auto-replace: if an instance is running, focus it when it's
     # the same version, or tell it to quit and take over when it's older.

@@ -5,14 +5,17 @@ compiles it into a real `.apk`, all locally on the X395. Same shape as TheDawg:
 stdlib-only Python server + browser UI. SiliconFlow/DeepSeek-V4-Flash primary,
 Groq fallback.
 
-## Install (sole supported method)
+## Install (one paste, does everything)
 
 `curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash`
 
-Installs system build deps, a buildozer venv (cython pinned), the launcher, and a
-**desktop icon** - it shows up in your app menu as **"The Dawg APK Forge"**,
-clickable. (Commit `icon.png` to the repo so the installer can fetch it; it falls
-back gracefully if missing.)
+This wipes any previous install (keeping your saved API key), installs every
+system dependency, sets up **JDK 17** (via Temurin, since Kali has no
+`openjdk-17` package), installs buildozer + cython into your user site, pulls
+`apkforge.py` + `icon.png` from GitHub, and drops a clickable **app-menu icon**
+("The Dawg APK Forge"). Re-running it is a clean reinstall.
+
+License: MIT (see `LICENSE`).
 
 ## Keys
 
