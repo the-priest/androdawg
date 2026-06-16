@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# THE DAWG // APK FORGE - one-shot installer
+# THE DAWG // APK FORGE v2 - one-shot installer
 # Wipes any old install, pulls everything from GitHub, installs all deps + JDK 17.
+# v2 adds: manual mode, AI custom buildozer.spec, headless test-run, auto-fix/polish,
+# pro icon + presplash, and an own-icon app window (no more "looks like a Brave tab").
 # Run:  curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
 set -u
 
@@ -13,6 +15,7 @@ APP_DIR="$HOME/.androdawg"
 BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 HIC="$HOME/.local/share/icons/hicolor/256x256/apps"
+WMCLASS="AndroDawg"   # must match apkforge.py's --class so the panel shows OUR icon
 
 SELF="${BASH_SOURCE[0]:-}"
 if [ -n "$SELF" ] && [ -f "$SELF" ]; then
@@ -21,7 +24,7 @@ else
   SRC_DIR=""
 fi
 
-echo "[dawg] ===== The Dawg // APK Forge installer ====="
+echo "[dawg] ===== The Dawg // APK Forge v2 installer ====="
 
 # 1) clean old install (keep saved API keys), then recreate
 echo "[dawg] removing old install (keeping your saved settings)..."
@@ -39,9 +42,11 @@ if [ -f "/tmp/androdawg_config.bak" ]; then
 fi
 
 # 2) system build deps (per-package so one bad name can't sink the batch)
+# xvfb is added so the headless test-run can launch your app on a virtual display
+# and catch launch crashes in ~3s instead of after a 40-min Android build.
 SYS="git zip unzip python3 python3-pip python3-venv autoconf libtool pkg-config \
 zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache \
-wget gnupg ca-certificates apt-transport-https"
+wget gnupg ca-certificates apt-transport-https xvfb"
 if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
   echo "[dawg] installing system deps (sudo)..."
   sudo apt-get update -y || true
@@ -99,6 +104,15 @@ python3 -m pip install --user --break-system-packages --upgrade pip wheel >/dev/
 python3 -m pip install --user --break-system-packages "cython==0.29.36" buildozer \
   || echo "[dawg]   ERROR: buildozer pip install failed"
 
+# 3b) host Kivy for the headless test-run (OPTIONAL — never fails the install).
+# If it installs, pressing TEST RUN will actually launch your app on a virtual
+# display and tell you if it crashes on start. If it's absent, test-run just
+# reports "skipped" and the build still works fine.
+echo "[dawg] (optional) installing host Kivy for test-run..."
+python3 -m pip install --user --break-system-packages "kivy" >/dev/null 2>&1 \
+  && echo "[dawg]   host Kivy ready -> TEST RUN will catch launch crashes" \
+  || echo "[dawg]   host Kivy not installed (test-run will be skipped; builds still work)"
+
 # 4) fetch app + icon from GitHub (or local checkout)
 echo "[dawg] fetching app + icon..."
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/apkforge.py" ]; then
@@ -126,6 +140,9 @@ fi
 chmod +x "$BIN/androdawg"
 
 # 6) icon + desktop entry
+# StartupWMClass MUST equal the --class apkforge.py passes to the browser window.
+# That binding is what makes KDE/GNOME show THE DAWG's icon + name in the panel
+# (its own taskbar entry) instead of folding the window into Brave/Chromium.
 [ -f "$APP_DIR/icon.png" ] && cp "$APP_DIR/icon.png" "$HIC/androdawg.png" 2>/dev/null || true
 cat > "$APPS/androdawg.desktop" <<EOF
 [Desktop Entry]
@@ -139,6 +156,7 @@ Terminal=false
 Categories=Development;Building;Utility;
 Keywords=android;apk;kivy;buildozer;ai;forge;
 StartupNotify=true
+StartupWMClass=$WMCLASS
 EOF
 chmod +x "$APPS/androdawg.desktop"
 update-desktop-database "$APPS" >/dev/null 2>&1 || true
@@ -158,3 +176,4 @@ case ":$PATH:" in *":$BIN:"*) : ;; *) echo "[dawg] add to PATH:  export PATH=\"\
 echo "[dawg] Launch 'The Dawg APK Forge' from your menu, or run:  androdawg"
 echo "[dawg] First run: open Settings (gear), paste your SiliconFlow key."
 echo "[dawg] Build the SMOKE-TEST APP first to verify the toolchain."
+echo "[dawg] Tip: forge an app, hit TEST RUN to catch crashes, POLISH to glam it, then BUILD APK."

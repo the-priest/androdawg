@@ -443,6 +443,125 @@ def run_buildozer_missing_path():
         A.shutil.which = real_which
 
 
+
+def run_v2_endpoints():
+    print("[5] v2 endpoints (templates, fix, polish, testrun, icon, build overrides)")
+    # ---- pure-unit: BUILD override whitelist ----
+    ov, warns = A.parse_build_overrides(
+        "orientation=landscape\nfullscreen=1\napi=33\nminapi=24\n"
+        "presplash_color=#101510\nwakelock=1\nbogus_key=evil\nndk=99\napi=999")
+    check("override keep orientation", ov.get("orientation") == "landscape")
+    check("override keep fullscreen", ov.get("fullscreen") == "1")
+    check("override keep minapi", ov.get("minapi") == "24")
+    check("override keep presplash_color", ov.get("presplash_color") == "#101510")
+    check("override keep wakelock", ov.get("wakelock") == "1")
+    check("override drop bogus key", "bogus_key" not in ov)
+    check("override drop ndk (not whitelisted)", "ndk" not in ov)
+    check("override drop out-of-range api (999)", ov.get("api") != "999")
+    check("override warns on dropped keys", any(("bogus_key" in w or "ndk" in w) for w in warns))
+    ov_bad, _ = A.parse_build_overrides("presplash_color=notacolor\nminapi=5")
+    check("override drop bad hex color", "presplash_color" not in ov_bad)
+    check("override drop out-of-range minapi", "minapi" not in ov_bad)
+    # ---- make_spec honours new args ----
+    spec = A.make_spec("T", "pkg", "python3,kivy", "INTERNET", "portrait",
+                       archs="arm64-v8a,armeabi-v7a", overrides={"fullscreen": "1", "api": "33"})
+    check("spec multi-arch honoured", "android.archs = arm64-v8a,armeabi-v7a" in spec)
+    check("spec fullscreen override applied", "fullscreen = 1" in spec)
+    check("spec api override applied", "android.api = 33" in spec)
+    check("spec still single title", spec.count("\ntitle = ") == 1)
+    check("spec package.name still valid",
+          re.search(r"(?m)^package\.name = [a-z_][a-z0-9_]*$", spec) is not None)
+    check("spec still has arch substring (back-compat)", A.ANDROID_ARCHS in spec)
+    # ---- analyze_code returns structured issues ----
+    issues = A.analyze_code(GOOD_APP, "python3,kivy", "")
+    check("analyze_code returns list", isinstance(issues, list))
+    check("analyze_code items shaped", all(("sev" in i and "msg" in i) for i in issues))
+    # try-guarded android import is NOT flagged; unguarded IS
+    e_g, w_g = A.validate_code(
+        "try:\n    import android\nexcept Exception:\n    pass\n" + GOOD_APP, "python3,kivy")
+    check("try-guarded android no warn", not any("android" in x for x in w_g))
+    e_u, w_u = A.validate_code("import android\n" + GOOD_APP, "python3,kivy")
+    check("unguarded android warns", any("android" in x for x in w_u))
+    # ---- kit injection helpers ----
+    k = A.with_kit(GOOD_APP)
+    check("with_kit adds markers", A.KIT_BEGIN in k and A.KIT_END in k)
+    check("with_kit idempotent", A.with_kit(k) == A.ensure_kit(k))
+    sok, _ = A.syntax_check(k)
+    check("with_kit output parses", sok)
+
+    # ---- server-backed checks ----
+    canned = "<<<MAIN_PY>>>\n" + A.with_kit(GOOD_APP) + "\n<<<END>>>"
+    A.call_ai = lambda messages: (canned, "MockProvider")
+    A.PROJECTS = os.path.join(os.getcwd(), "_test_projects")
+    os.makedirs(A.PROJECTS, exist_ok=True)
+    A.CONFIG_DIR = os.path.join(os.getcwd(), "_test_cfg")
+    A.CONFIG_PATH = os.path.join(A.CONFIG_DIR, "config.json")
+    A.CONFIG = dict(A.DEFAULT_CONFIG)
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), A.H)
+    port = srv.server_address[1]
+    base = "http://127.0.0.1:%d" % port
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        # icon routes (own-icon-in-panel: window favicon)
+        s, b = http_bytes(base + "/icon.png")
+        check("icon.png 200", s == 200)
+        check("icon.png is real PNG", b[:8] == b"\x89PNG\r\n\x1a\n")
+        s, b = http_bytes(base + "/favicon.ico")
+        check("favicon.ico serves PNG", s == 200 and b[:8] == b"\x89PNG\r\n\x1a\n")
+        # index references the favicon so the app-window titlebar uses it
+        s, hb = http_bytes(base + "/")
+        check("index links favicon", b'rel="icon"' in hb and b'/icon.png' in hb)
+
+        # templates
+        s, d = http_json("GET", base + "/api/templates")
+        check("templates 200 list", s == 200 and isinstance(d.get("templates"), list) and len(d["templates"]) >= 1)
+        tid0 = d["templates"][0]["id"]
+        s, d = http_json("GET", base + "/api/template?id=" + tid0)
+        check("template payload has main_py", s == 200 and bool(d.get("main_py")))
+        check("template carries kit", A.KIT_BEGIN in d.get("main_py", ""))
+        s, d = http_json("GET", base + "/api/template?id=__nope__")
+        check("unknown template 404", s == 404)
+
+        # fix (mocked AI) -> forge-shaped payload, kit preserved
+        s, d = http_json("POST", base + "/api/fix", {"main_py": GOOD_APP, "error": "boom"})
+        check("fix 200 ok", s == 200 and d.get("ok") and bool(d.get("main_py")))
+        check("fix output carries kit", A.KIT_BEGIN in d.get("main_py", ""))
+        s, d = http_json("POST", base + "/api/fix", {"main_py": ""})
+        check("fix empty 400", s == 400)
+
+        # polish (mocked AI)
+        s, d = http_json("POST", base + "/api/polish", {"main_py": GOOD_APP})
+        check("polish 200 ok", s == 200 and d.get("ok") and bool(d.get("main_py")))
+        s, d = http_json("POST", base + "/api/polish", {"main_py": ""})
+        check("polish empty 400", s == 400)
+
+        # testrun: guards
+        s, d = http_json("POST", base + "/api/testrun", {"main_py": ""})
+        check("testrun empty 400", s == 400)
+        s, d = http_json("POST", base + "/api/testrun", {"main_py": "def x(:\n pass\n"})
+        check("testrun syntax-broken 400", s == 400)
+        # testrun: real kit app reaches a terminal status (tolerant of skip if no kivy/display)
+        s, d = http_json("POST", base + "/api/testrun",
+                         {"main_py": A.with_kit(GOOD_APP), "requirements": "python3,kivy"})
+        check("testrun 200 test_id", s == 200 and bool(d.get("test_id")))
+        tid = d.get("test_id")
+        terminal = {"pass", "fail", "warn", "timeout", "skipped"}
+        status = "running"
+        for _ in range(450):  # up to ~45s
+            s, d = http_json("GET", base + "/api/testlog?id=" + tid)
+            status = d.get("status")
+            if status in terminal:
+                break
+            time.sleep(0.1)
+        check("testrun reaches terminal status", status in terminal)
+        s, d = http_json("GET", base + "/api/testlog?id=__nope__")
+        check("testlog unknown 404", s == 404)
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200000
     run_parser_cases()
@@ -451,6 +570,7 @@ if __name__ == "__main__":
     hammer_parser(n)
     run_http_pipeline()
     run_buildozer_missing_path()
+    run_v2_endpoints()
     print()
     print("=" * 50)
     print("PASS: %d   FAIL: %d" % (PASS, FAIL))
