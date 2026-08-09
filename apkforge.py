@@ -1663,6 +1663,37 @@ def cache_clear():
     return n
 
 
+def _provider_error(name, e, model):
+    """Turn an HTTP error from a provider into something the user can act on.
+    The whole point: a rejected KEY and a wrong MODEL must not look the same."""
+    try:
+        raw = e.read().decode("utf-8")
+    except Exception:
+        raw = ""
+    detail = ""
+    try:
+        j = json.loads(raw)
+        detail = (j.get("error") or {}).get("message") if isinstance(j.get("error"), dict) else j.get("message")
+        detail = detail or j.get("error") or ""
+    except Exception:
+        detail = raw[:200]
+    code = e.code
+    if code in (401, 403):
+        # 403 with an allowlist note is this sandbox, not the user's key
+        if "allowlist" in (detail or "").lower() or "egress" in (detail or "").lower():
+            return "%s network blocked: %s" % (name, detail)
+        return ("%s rejected the API key (HTTP %s). The key is wrong, expired, or has no "
+                "credit. Re-check it in Settings. [%s]" % (name, code, detail or "no detail"))
+    if code == 404 or (code == 400 and "model" in (detail or "").lower()):
+        return ("%s doesn't recognise the model '%s' (HTTP %s). Pick a different model in "
+                "Settings. [%s]" % (name, model, code, detail or "no detail"))
+    if code == 429:
+        return "%s rate-limited / out of quota (HTTP 429). [%s]" % (name, detail or "")
+    if code >= 500:
+        return "%s server error (HTTP %s) -- their side, try again shortly. [%s]" % (name, code, detail or "")
+    return "%s HTTP %s: %s" % (name, code, detail or raw[:200])
+
+
 def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
     """One metered, cached, budget-guarded model call."""
     check_budget()
@@ -1694,18 +1725,15 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
             cache_put(key, text, prov)
             return text, prov
         except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8")[:300]
-            except Exception:
-                body = ""
-            errs.append("SiliconFlow %s at %s: %s" % (e.code, sf_u, body))
+            errs.append(_provider_error("SiliconFlow", e, model))
         except Exception as e:
             errs.append("SiliconFlow (%s): %s" % (sf_u, e))
     if gq:
         gq_u = chat_url(CONFIG.get("groq_url") or GROQ_URL)
+        gq_model = CONFIG.get("groq_model") or GROQ_MODEL
         try:
             d = _post_json(gq_u, gq, {
-                "model": CONFIG.get("groq_model") or GROQ_MODEL, "messages": messages,
+                "model": gq_model, "messages": messages,
                 "temperature": temperature, "max_tokens": max_tokens,
             })
             text = d["choices"][0]["message"]["content"]
@@ -1716,15 +1744,12 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
             cache_put(key, text, prov)
             return text, prov
         except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode("utf-8")[:300]
-            except Exception:
-                body = ""
-            errs.append("Groq %s: %s" % (e.code, body))
+            errs.append(_provider_error("Groq", e, gq_model))
         except Exception as e:
             errs.append("Groq: %s" % e)
     if not sf and not gq:
-        raise RuntimeError("No API key. Open Settings (gear) and add your SiliconFlow key, or set SILICONFLOW_API_KEY.")
+        raise RuntimeError("No API key set. Open Settings (the gear, top right), paste your "
+                           "SiliconFlow key, and click Save -- or set SILICONFLOW_API_KEY before launching.")
     raise RuntimeError(" | ".join(errs) or "AI call failed")
 
 
@@ -2459,6 +2484,23 @@ class H(BaseHTTPRequestHandler):
                                    os.path.basename(rec["apk"]))
         if path == "/api/ping":
             return self._send(200, {"app": "androdawg", "version": VERSION, "ok": True})
+        if path == "/api/keytest":
+            # A one-token live call so the user can see EXACTLY why the key is or isn't
+            # working -- no guessing between a bad key, a bad model, and a network block.
+            if not sf_key() and not groq_key():
+                return self._send(200, {"ok": False, "stage": "nokey",
+                    "detail": "No API key is set. Paste your SiliconFlow key above and Save first."})
+            was = CONFIG.get("cache")
+            CONFIG["cache"] = False  # never answer a key test from cache
+            try:
+                txt, prov = call_ai([{"role": "user", "content": "ping"}],
+                                    temperature=0, max_tokens=1, label="keytest")
+                return self._send(200, {"ok": True, "provider": prov,
+                    "detail": "Key works. Reached %s and got a reply." % prov})
+            except Exception as e:
+                return self._send(200, {"ok": False, "stage": "call", "detail": str(e)})
+            finally:
+                CONFIG["cache"] = was
         if path == "/api/doctor":
             return self._send(200, {"checks": doctor(), "can_test": host_can_test()})
         if path == "/api/templates":
@@ -3298,6 +3340,7 @@ INDEX_HTML = r"""<!doctype html>
 
     <div class="row" style="margin-top:4px">
       <button class="primary" onclick="saveSettings()">Save</button>
+      <button class="accent" onclick="testKey()" id="keytestBtn">Test key</button>
       <button class="ghost" onclick="closeSettings()">Close</button>
       <span class="hint" id="setmsg"></span>
     </div>
@@ -3833,7 +3876,24 @@ async function openSettings(){
 function closeSettings(){ hide('settings'); }
 function overlayClick(e){ if(e.target && e.target.id==='settings') closeSettings(); }
 
-async function saveSettings(){
+async function testKey(){
+  // save whatever's typed first, so we test what the user is actually looking at
+  await saveSettings(true);
+  var done=busy('keytestBtn','testing');
+  $('setmsg').textContent='';
+  try{
+    var r=await fetch('/api/keytest',{method:'POST'});
+    var d=await r.json();
+    $('setmsg').innerHTML = d.ok
+      ? '<span style="color:var(--green)">\u2713 '+esc(d.detail)+'</span>'
+      : '<span style="color:var(--danger)">\u2717 '+esc(d.detail)+'</span>';
+    toast(d.ok?'key works':'key test failed', d.ok?'ok':'bad');
+    loadDoctor();
+  }catch(e){ $('setmsg').textContent='error: '+e; }
+  finally{ done(); }
+}
+
+async function saveSettings(silent){
   var sel=$('sf_model_sel');
   var model=(sel.value==='__custom__')?$('sf_model_custom').value.trim():sel.value;
   var body={sf_key:$('sf_key').value, groq_key:$('groq_key').value, sf_model:model,
@@ -3849,7 +3909,7 @@ async function saveSettings(){
     var d=await r.json();
     $('setmsg').textContent=d.saved?'saved':'save failed (check ~/.androdawg perms)';
     loadDoctor();
-    if(d.saved){ toast('settings saved','ok'); setTimeout(closeSettings,450); }
+    if(d.saved && !silent){ toast('settings saved','ok'); setTimeout(closeSettings,450); }
   }catch(e){ $('setmsg').textContent='error: '+e; }
 }
 
