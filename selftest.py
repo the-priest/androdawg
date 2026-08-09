@@ -254,6 +254,32 @@ def http_post_bytes(url, body):
         return r.status, r.read()
 
 
+def http_raw(method, url, body=None):
+    """Like http_json but returns raw bytes -- for the HTML index."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def start_server():
+    """Spin up the real handler on an ephemeral port against isolated temp state.
+    Returns (server, base_url); caller must srv.shutdown()."""
+    A.PROJECTS = os.path.join(os.getcwd(), "_test_projects")
+    os.makedirs(A.PROJECTS, exist_ok=True)
+    A.CONFIG_DIR = os.path.join(os.getcwd(), "_test_cfg")
+    A.CONFIG_PATH = os.path.join(A.CONFIG_DIR, "config.json")
+    A.CACHEDIR = os.path.join(os.getcwd(), "_test_cache")
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), A.H)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, base
+
+
 def run_http_pipeline():
     print("[3] full HTTP pipeline (mocked AI + mocked buildozer)")
 
@@ -263,7 +289,7 @@ def run_http_pipeline():
         "<<<REQUIREMENTS>>>\npython3,kivy\n<<<PERMISSIONS>>>\nINTERNET\n<<<MAIN_PY>>>\n"
         + GOOD_APP + "\n<<<NOTES>>>\nmocked\n<<<END>>>"
     )
-    A.call_ai = lambda messages: (canned, "MockProvider")
+    A.call_ai = lambda messages, **kw: (canned, "MockProvider")
 
     # pretend buildozer exists + mock the subprocess
     real_which = A.shutil.which
@@ -491,7 +517,7 @@ def run_v2_endpoints():
 
     # ---- server-backed checks ----
     canned = "<<<MAIN_PY>>>\n" + A.with_kit(GOOD_APP) + "\n<<<END>>>"
-    A.call_ai = lambda messages: (canned, "MockProvider")
+    A.call_ai = lambda messages, **kw: (canned, "MockProvider")
     A.PROJECTS = os.path.join(os.getcwd(), "_test_projects")
     os.makedirs(A.PROJECTS, exist_ok=True)
     A.CONFIG_DIR = os.path.join(os.getcwd(), "_test_cfg")
@@ -517,10 +543,16 @@ def run_v2_endpoints():
         # templates
         s, d = http_json("GET", base + "/api/templates")
         check("templates 200 list", s == 200 and isinstance(d.get("templates"), list) and len(d["templates"]) >= 1)
-        tid0 = d["templates"][0]["id"]
-        s, d = http_json("GET", base + "/api/template?id=" + tid0)
-        check("template payload has main_py", s == 200 and bool(d.get("main_py")))
-        check("template carries kit", A.KIT_BEGIN in d.get("main_py", ""))
+        # v3: templates declare whether they ship the kit. "blank" deliberately ships
+        # nothing at all -- an empty editor is the point of manual mode.
+        by_id = {t["id"]: t for t in d["templates"]}
+        check("blank template declares no kit", by_id["blank"]["kit"] is False)
+        s, d = http_json("GET", base + "/api/template?id=kit")
+        check("kit template has main_py", s == 200 and bool(d.get("main_py")))
+        check("kit template carries the kit", A.KIT_BEGIN in d.get("main_py", ""))
+        s, d = http_json("GET", base + "/api/template?id=min")
+        check("min template has code but no kit",
+              bool(d.get("main_py")) and A.KIT_BEGIN not in d.get("main_py", ""))
         s, d = http_json("GET", base + "/api/template?id=__nope__")
         check("unknown template 404", s == 404)
 
@@ -562,6 +594,185 @@ def run_v2_endpoints():
         srv.shutdown()
 
 
+# ============================================================== v3 additions
+def run_kit_api_tests():
+    """The kit API the prompt advertises must match the kit source, byte for byte.
+    v2 shipped a prompt describing Theme.BG / IconButton(glyph=) -- neither existed --
+    and every app that touched the theme crashed on launch."""
+    print("\n[v3] kit API contract")
+    # every Theme attribute named in the generated prompt really exists
+    named = re.findall(r"Theme\.(\w+)", A.KIT_API)
+    for attr in set(named):
+        check("prompt's Theme.%s exists in the kit" % attr, attr in A.KIT_INFO["theme_attrs"])
+    # the prompt must not resurrect the v2 ghosts
+    for ghost in ("Theme.BG", "Theme.TXT", "Theme.ACCENT2", "Theme.GOOD", "Theme.BAD"):
+        check("prompt no longer claims %s" % ghost, ghost not in A.SYSTEM_PROMPT)
+    check("prompt no longer claims IconButton(glyph=)", "glyph=" not in A.SYSTEM_PROMPT)
+    # kit introspection found the real widgets
+    for w in ("Theme", "Card", "PillButton", "IconButton", "TextField", "AppBar",
+              "GradientBackground", "Divider"):
+        check("kit exposes %s" % w, w in A.KIT_PUBLIC)
+    check("IconButton takes text=", "text" in A.KIT_INFO["ctor_kwargs"]["IconButton"])
+    check("AppBar takes subtitle=", "subtitle" in A.KIT_INFO["ctor_kwargs"]["AppBar"])
+    # every shipped template must be clean under our own analyser
+    for tid, t in A.TEMPLATES.items():
+        code = A.with_kit(t["code"]) if t.get("kit", True) else t["code"]
+        if not code.strip():
+            continue
+        errs = [i for i in A.analyze_code(code, "python3,kivy", "") if i["sev"] == "error"]
+        check("template '%s' has no blocking issues" % tid, not errs)
+        ok, msg = A.syntax_check(code)
+        check("template '%s' parses" % tid, ok)
+
+
+def run_analysis_tests():
+    print("\n[v3] static analysis")
+    cases = [
+        ("Theme.NOPE",       "c = Card(); x = Theme.NOPE", "error", "Theme.NOPE"),
+        ("bad kit kwarg",    "b = IconButton(glyph='+')",  "error", "glyph"),
+        ("undefined name",   "w = Chip(text='x')",         "error", "Chip"),
+        ("kv file",          "Builder.load_file('a.kv')",  "error", ".kv"),
+        ("subprocess",       "import subprocess\nsubprocess.run(['ls'])", "error", "shell"),
+        ("time.sleep",       "import time\ntime.sleep(5)", "warn",  "ANR"),
+        ("bare except",      "try:\n    pass\nexcept:\n    pass", "info", "bare"),
+    ]
+    for label, snippet, sev, needle in cases:
+        issues = A.analyze_code(snippet, "python3,kivy", "")
+        hit = any(i["sev"] == sev and needle.lower() in i["msg"].lower() for i in issues)
+        check("analysis flags %s as %s" % (label, sev), hit)
+    # and must NOT cry wolf on healthy code
+    good = A.with_kit(A.TEMPLATES["kit"]["code"])
+    errs = [i for i in A.analyze_code(good, "python3,kivy", "") if i["sev"] == "error"]
+    check("no false positives on the kit starter", not errs)
+    check("empty file produces no issues", A.analyze_code("", "python3,kivy", "") == [])
+
+
+def run_repair_tests():
+    print("\n[v3] local auto-repair (must cost 0 tokens)")
+    before = dict(A.USAGE)
+    bad = ("import requests\n"
+           "from kivy.app import App\n"
+           "class MyApp(App):\n"
+           "    def build(self):\n"
+           "        Window.size = (400, 800)\n"
+           "        return Card(bg=Theme.TXT)\n")
+    code, reqs, perms, fixes = A.auto_repair(bad, "python3,kivy", "")
+    check("repair fixes Theme.TXT", "Theme.text" in code and "Theme.TXT" not in code)
+    check("repair fixes Card(bg=)", "fill=" in code and "bg=" not in code)
+    check("repair drops Window.size", "Window.size" not in code)
+    check("repair declares requests", "requests" in reqs)
+    check("repair declares INTERNET", "INTERNET" in perms)
+    check("repair appends missing run()", ".run()" in code)
+    check("repair reported every change", len(fixes) >= 5)
+    check("repair spent no tokens", dict(A.USAGE) == before)
+    # idempotent: repairing clean code changes nothing
+    code2, _, _, fixes2 = A.auto_repair(code, reqs, perms)
+    check("repair is idempotent", not fixes2)
+
+
+def run_token_tests():
+    print("\n[v3] token discipline")
+    full = A.with_kit(A.TEMPLATES["kit"]["code"])
+    app = A.strip_kit(full)
+    check("strip_kit removes the kit", A.KIT_BEGIN not in app)
+    check("strip_kit keeps the app", "class MyApp" in app)
+    check("strip_kit round-trips", A.strip_kit(A.with_kit(app)).strip() == app.strip())
+    saved = A.est_tokens(full) - A.est_tokens(app)
+    check("stripping the kit saves >1000 tokens/call", saved > 1000)
+    print("      (~%d tokens saved per fix/polish round, each way)" % saved)
+    # metering
+    A.USAGE.update({"calls": 0, "prompt": 0, "completion": 0, "total": 0, "cached": 0, "saved": 0})
+    A.meter(100, 50)
+    check("meter accumulates", A.USAGE["total"] == 150 and A.USAGE["calls"] == 1)
+    # budget guard
+    A.CONFIG["token_budget"] = 100
+    try:
+        A.check_budget()
+        check("budget stops an over-spend", False)
+    except RuntimeError:
+        check("budget stops an over-spend", True)
+    A.CONFIG["token_budget"] = 0
+    check("no budget = unlimited", A.budget_left() is None)
+    A.check_budget()
+
+
+def run_v3_endpoints():
+    print("\n[v3] endpoints")
+    srv, base = start_server()
+    try:
+        s, d = http_json("GET", base + "/api/usage")
+        check("usage 200", s == 200 and "usage" in d)
+        check("usage reports kit size", d.get("kit_lines", 0) > 100)
+
+        # blank template must be genuinely empty -- that is the whole point of manual mode
+        s, d = http_json("GET", base + "/api/template?id=blank")
+        check("blank template 200", s == 200)
+        check("blank template is empty", d.get("main_py") == "")
+        check("blank template has no kit", d.get("kit") is False)
+        check("blank template raises no issues", not d.get("issues"))
+
+        # manual endpoint honours the kit toggle
+        s, d = http_json("POST", base + "/api/manual",
+                         {"main_py": "x = 1\n", "kit": False})
+        check("manual without kit is verbatim", d.get("main_py") == "x = 1\n")
+        s, d = http_json("POST", base + "/api/manual",
+                         {"main_py": "x = 1\n", "kit": True})
+        check("manual with kit prepends it", A.KIT_BEGIN in d.get("main_py", ""))
+
+        # lint
+        s, d = http_json("POST", base + "/api/lint",
+                         {"main_py": "x = Theme.NOPE", "requirements": "python3,kivy"})
+        check("lint 200", s == 200)
+        check("lint catches the bad attribute", any("Theme.NOPE" in i["msg"] for i in d["issues"]))
+        s, d = http_json("POST", base + "/api/lint", {"main_py": "def (:", "requirements": ""})
+        check("lint reports syntax errors", d.get("syntax_ok") is False)
+
+        # repair endpoint
+        s, d = http_json("POST", base + "/api/repair",
+                         {"main_py": "c = Card(bg=Theme.TXT)", "requirements": "python3,kivy"})
+        check("repair 200", s == 200)
+        check("repair returns fixes", len(d.get("repairs") or []) >= 2)
+        check("repair burned no tokens", d["usage"]["calls"] == A.USAGE["calls"])
+
+        # autoforge needs something to work with
+        s, d = http_json("POST", base + "/api/autoforge", {})
+        check("autoforge with nothing -> 400", s == 400)
+
+        s, d = http_json("GET", base + "/api/job?id=__nope__")
+        check("unknown job 404", s == 404)
+
+        # efficiency settings persist
+        s, d = http_json("POST", base + "/api/config",
+                         {"max_tokens": 8000, "token_budget": 50000,
+                          "agent_rounds": 2, "cache": False, "auto_repair": False})
+        check("efficiency settings saved", s == 200 and d.get("saved"))
+        s, d = http_json("GET", base + "/api/config")
+        check("max_tokens persisted", d.get("max_tokens") == 8000)
+        check("token_budget persisted", d.get("token_budget") == 50000)
+        check("agent_rounds persisted", d.get("agent_rounds") == 2)
+        check("cache flag persisted", d.get("cache") is False)
+        # clamp out-of-range values rather than trusting the client
+        http_json("POST", base + "/api/config", {"max_tokens": 999999, "agent_rounds": 99})
+        s, d = http_json("GET", base + "/api/config")
+        check("max_tokens clamped", d.get("max_tokens") <= 32000)
+        check("agent_rounds clamped", d.get("agent_rounds") <= 6)
+        A.CONFIG["cache"] = True
+        A.CONFIG["auto_repair"] = True
+        A.CONFIG["token_budget"] = 0
+
+        s, d = http_json("POST", base + "/api/cache_clear")
+        check("cache clear 200", s == 200 and "removed" in d)
+
+        # the UI must actually reference every route it calls
+        s, html = http_raw("GET", base + "/")
+        page = html.decode()
+        for route in ("/api/lint", "/api/repair", "/api/autoforge", "/api/usage",
+                      "/api/manual", "/api/job", "/api/cache_clear"):
+            check("UI wires up %s" % route, route in page)
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200000
     run_parser_cases()
@@ -571,6 +782,11 @@ if __name__ == "__main__":
     run_http_pipeline()
     run_buildozer_missing_path()
     run_v2_endpoints()
+    run_kit_api_tests()
+    run_analysis_tests()
+    run_repair_tests()
+    run_token_tests()
+    run_v3_endpoints()
     print()
     print("=" * 50)
     print("PASS: %d   FAIL: %d" % (PASS, FAIL))

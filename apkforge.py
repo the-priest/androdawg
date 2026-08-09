@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """
-THE DAWG // APK FORGE  v2
+THE DAWG // APK FORGE  v3
 Describe an Android app (or write it yourself) -> forge a polished, single-file Kivy
-app -> static-check it -> RUN it headless to catch launch crashes BEFORE the 40-min
-build -> auto-fix issues in a loop -> compile a real .apk with Buildozer.
+app -> static-check it -> SELF-TEST it headless (build, tap every button, rotate,
+soak) to catch crashes BEFORE the 40-min build -> repair/fix in a loop -> compile a
+real .apk with Buildozer.
 
-Stdlib-only server + browser UI. SiliconFlow/DeepSeek-V4-Flash primary, Groq fallback.
+Stdlib-only server + browser UI. SiliconFlow primary, Groq fallback.
 Keys are set in the in-app Settings (gear) or via env (SILICONFLOW_API_KEY / GROQ_API_KEY).
 
-What's new in v2:
-  - MANUAL mode: hand-write main.py + spec, same validate/test/build pipeline.
-  - A built-in pro UI kit is prepended to forged apps so they don't look default-grey.
-  - Auto-generated gradient launcher icon + matching splash (kills the white-launch flash).
-  - The AI may set a whitelisted, value-validated build config (can't brick a build).
-  - Headless "TEST RUN" executes the app under Xvfb and reports real tracebacks.
-  - AUTO-FIX feeds errors back to the model; POLISH restyles with the kit.
+What's new in v3:
+  - The system prompt's kit API is GENERATED from the kit's AST. v2 advertised
+    Theme.BG / Theme.TXT / IconButton(glyph=) -- none of which existed -- so the model
+    was being told to write code that AttributeErrors on launch. That is fixed at the
+    root, and a selftest asserts prompt and kit can never drift apart again.
+  - Static analysis now catches wrong Theme attrs, fake kit kwargs, undefined names,
+    .kv loads, subprocess use, UI-thread sleeps, un-chained Widget.__init__ and more.
+  - auto_repair(): deterministic fixes for the common faults, at ZERO token cost.
+  - Token discipline: the ~305-line kit is stripped from every AI call (~2.9k tokens
+    saved each way per round), history no longer replays whole past apps, responses
+    are cached on disk, usage is metered from the API and a hard session budget applies.
+  - The self-test is 8 real phases instead of "run it for 2 seconds".
+  - /api/autoforge: forge -> repair -> lint -> self-test -> fix, looping until it
+    passes or it hits a stop condition (never spending on a repeat answer).
+  - MANUAL mode opens a genuinely empty file -- no kit, no scaffold.
+  - Rebuilt UI: line-numbered editor, live linting, phase chips, agent rail, token meter.
 """
 
 import os
@@ -52,11 +62,12 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "2.0"
+VERSION = "3.0"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
 TESTDIR = os.path.join(WORKDIR, "testruns")
+CACHEDIR = os.path.join(WORKDIR, "aicache")
 
 # arm64 only -> covers every modern phone (incl. ROG Phone 5S / SD888+) and halves
 # build time. add ,armeabi-v7a here if you ever need to support 32-bit hardware.
@@ -64,6 +75,42 @@ ANDROID_ARCHS = "arm64-v8a"
 
 BUILDS = {}   # build_id -> {"log":[...], "status": "...", "apk": path|None}
 TESTS = {}    # test_id  -> {"log":[...], "status": "...", "summary": str}
+JOBS = {}     # job_id   -> agent-loop record (steps, payload, status)
+
+# ----------------------------------------------------------------- token accounting
+# Every AI call is metered here so the UI can show exactly what a session costs and
+# a hard budget can stop a runaway loop from eating the key.
+USAGE = {"calls": 0, "prompt": 0, "completion": 0, "total": 0, "cached": 0, "saved": 0}
+_USAGE_LOCK = threading.Lock()
+
+
+def meter(prompt_tok, completion_tok, cached=False, saved=0):
+    with _USAGE_LOCK:
+        if cached:
+            USAGE["cached"] += 1
+            USAGE["saved"] += int(saved or 0)
+            return
+        USAGE["calls"] += 1
+        USAGE["prompt"] += int(prompt_tok or 0)
+        USAGE["completion"] += int(completion_tok or 0)
+        USAGE["total"] = USAGE["prompt"] + USAGE["completion"]
+
+
+def budget_left():
+    """Tokens remaining this session, or None when no budget is set."""
+    cap = int(CONFIG.get("token_budget") or 0)
+    if cap <= 0:
+        return None
+    return max(0, cap - USAGE["total"])
+
+
+def check_budget():
+    left = budget_left()
+    if left is not None and left <= 0:
+        raise RuntimeError(
+            "session token budget of %s is used up (%s spent). Raise or clear the budget "
+            "in Settings, or restart to reset the counter."
+            % (CONFIG.get("token_budget"), USAGE["total"]))
 
 # ----------------------------------------------------------------- settings store
 CONFIG_DIR = os.path.expanduser("~/.androdawg")
@@ -73,6 +120,12 @@ DEFAULT_CONFIG = {
     "sf_key": "", "groq_key": "",
     "sf_model": SF_MODEL, "sf_url": SF_URL,
     "groq_model": GROQ_MODEL, "groq_url": GROQ_URL,
+    # --- efficiency knobs (all about not burning tokens) ---
+    "max_tokens": 12000,      # per-call output ceiling
+    "token_budget": 0,        # 0 = unlimited; otherwise a hard session cap
+    "cache": True,            # reuse identical prior responses for free
+    "auto_repair": True,      # fix what we can locally before ever calling the AI
+    "agent_rounds": 3,        # max fix rounds in the autoforge loop
 }
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -134,6 +187,113 @@ def with_kit(app_code):
     if KIT_BEGIN in app_code:
         return ensure_kit(app_code)
     return KIT.strip() + "\n\n\n" + app_code.strip() + "\n"
+
+
+def strip_kit(full_code):
+    """Inverse of with_kit: return the APP portion only.
+
+    This is the single biggest token saver in the app. The kit is ~9 KB; sending it to
+    the model on every fix/polish round and having the model echo it back burned ~5k
+    tokens each way for zero benefit -- the kit never changes.
+    """
+    code = full_code or ""
+    if KIT_END in code:
+        return code.split(KIT_END, 1)[1].lstrip("\n")
+    return code
+
+
+def kit_line_offset():
+    """How many lines the kit occupies, so editor line numbers can be translated."""
+    return len(KIT.strip().splitlines())
+
+
+# ----------------------------------------------------------------- kit introspection
+# The v2 system prompt described a kit API that did not exist (Theme.BG / Theme.TXT /
+# IconButton(glyph=...)), so a large share of forged apps died with AttributeError or
+# TypeError on launch. The prompt is now GENERATED from the kit source, so the two can
+# never drift again, and the same introspection powers a static check.
+def _parse_kit():
+    info = {"theme_attrs": set(), "names": set(), "ctor_kwargs": {}, "funcs": {},
+            "imported": set()}
+    try:
+        tree = ast.parse(KIT)
+    except Exception:
+        return info
+    # names the kit itself imports are in scope for the app spliced beneath it
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                info["imported"].add(al.asname or al.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for al in node.names:
+                info["imported"].add(al.asname or al.name)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            info["names"].add(node.name)
+            if node.name == "Theme":
+                for sub in node.body:
+                    if isinstance(sub, ast.Assign):
+                        for t in sub.targets:
+                            if isinstance(t, ast.Name):
+                                info["theme_attrs"].add(t.id)
+                    elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        info["theme_attrs"].add(sub.name)
+            for sub in node.body:
+                if isinstance(sub, ast.FunctionDef) and sub.name == "__init__":
+                    kws = [a.arg for a in sub.args.args[1:]]
+                    kws += [a.arg for a in getattr(sub.args, "kwonlyargs", [])]
+                    info["ctor_kwargs"][node.name] = set(kws)
+        elif isinstance(node, ast.FunctionDef):
+            info["names"].add(node.name)
+            info["funcs"][node.name] = [a.arg for a in node.args.args]
+    return info
+
+
+KIT_INFO = _parse_kit()
+# names a generated app may reference without defining them (they come from the kit)
+KIT_PUBLIC = sorted(n for n in KIT_INFO["names"] if not n.startswith("_"))
+THEME_ATTRS = sorted(a for a in KIT_INFO["theme_attrs"] if not a.startswith("_"))
+
+# every widget the kit ships takes **kw straight through to its Kivy base, so only
+# flag a kwarg when it is neither a kit ctor arg nor a plausible Kivy property.
+KIVY_COMMON_KW = {
+    "size_hint", "size_hint_x", "size_hint_y", "size", "width", "height", "pos",
+    "pos_hint", "x", "y", "orientation", "padding", "spacing", "text", "font_size",
+    "color", "bold", "italic", "halign", "valign", "text_size", "opacity", "disabled",
+    "multiline", "hint_text", "password", "readonly", "input_filter", "markup",
+    "id", "canvas", "cols", "rows", "on_release", "on_press", "on_text_validate",
+    "background_color", "shorten", "line_height", "font_name", "max_lines",
+}
+
+
+def kit_api_reference():
+    """The kit's real API, rendered for the system prompt. Generated, never hand-typed."""
+    L = []
+    L.append("- Theme : palette class. Attributes (each an rgba tuple unless noted): "
+             + ", ".join("Theme." + a for a in THEME_ATTRS if a not in ("seed",)))
+    L.append("    Theme.radius / Theme.pad / Theme.gap are dp numbers, not colours.")
+    L.append("    Call Theme.seed(\"Your App Name\") ONCE at startup to derive a unique "
+             "primary/accent from the name.")
+    sigs = [
+        ("GradientBackground", "FloatLayout that paints a vertical gradient. Use as your root."),
+        ("AppBar", "top bar."),
+        ("Card", "rounded raised surface (a BoxLayout)."),
+        ("PillButton", "rounded button; bind on_release."),
+        ("IconButton", "round compact button."),
+        ("TextField", "rounded text input; read .text."),
+        ("Divider", "thin separator line."),
+    ]
+    for name, blurb in sigs:
+        kw = KIT_INFO["ctor_kwargs"].get(name, set())
+        args = ", ".join(sorted(kw)) if kw else ""
+        L.append("- %s(%s) : %s" % (name, args + (", **kw" if args else "**kw"), blurb))
+    for fn in ("heading", "body", "toast"):
+        if fn in KIT_INFO["funcs"]:
+            L.append("- %s(%s)" % (fn, ", ".join(KIT_INFO["funcs"][fn])))
+    return "\n".join(L)
+
+
+KIT_API = kit_api_reference()
 
 # ----------------------------------------------------------------- icon + splash (pure stdlib)
 def _png_bytes(w, h, buf):
@@ -286,21 +446,17 @@ def write_assets(project_dir, name):
     return icon_ok, splash_ok
 
 # ----------------------------------------------------------------- prompts
+_KIT_CONTRACT = """A POLISHED UI KIT IS ALREADY DEFINED ABOVE YOUR CODE. It is NOT shown to you and it never changes. Do NOT paste it, do NOT redefine it, do NOT import it, do NOT output it -- these names are already in the module namespace and you call them directly. This is the EXACT API, copied from the kit source; using any other attribute name is an instant crash:
+
+%s
+
+Kit widgets pass any extra keyword straight to their Kivy base, so size_hint / pos_hint / padding / spacing / height etc. all work as normal.
+PillButton variant is one of: "primary", "ghost", "danger".
+""" % KIT_API
+
 SYSTEM_PROMPT = """You are The Dawg (APK edition), an elite Android app smith. The user describes an app; you forge a COMPLETE, runnable, single-file Kivy app that gets cross-compiled to an .apk with Buildozer / python-for-android and must look like a polished Google-Play app and launch first try on a modern arm64 phone.
 
-A POLISHED UI KIT IS ALREADY DEFINED ABOVE YOUR CODE. Do NOT paste it, do NOT redefine it, do NOT import it -- these names are already in the module namespace and you call them directly:
-- Theme            : dark palette. Theme.BG, Theme.SURFACE, Theme.TXT, Theme.MUTED, Theme.ACCENT, Theme.ACCENT2, Theme.GOOD, Theme.WARN, Theme.BAD (each is an rgba list). Call Theme.seed("Your App Name") ONCE at startup to derive a unique accent from the name.
-- GradientBackground(**kw) : a FloatLayout that paints a vertical gradient. Use it as your root and add children on top.
-- AppBar(title="", subtitle="")          : top bar.
-- Card(**kw)        : rounded raised surface (a BoxLayout); set padding/spacing/orientation as usual, add children.
-- PillButton(text="", variant="primary") : rounded button, variants "primary" | "ghost" | "danger". bind on_release.
-- IconButton(glyph="+")  : round compact button (glyph is a short unicode char).
-- TextField(hint="")     : rounded text input; read .text.
-- Divider()         : thin separator line.
-- heading(text)     : big bold Label (returns a Label).
-- body(text)        : normal Label.
-- toast(text)       : transient on-screen message; call from anywhere.
-
+""" + _KIT_CONTRACT + """
 HARD RULES
 - Output a single self-contained app. No placeholders, no TODO, no "...". Real working code top to bottom.
 - Kivy ONLY. NEVER tkinter / PyQt / PySide / GTK(gi) / wx / curses / pygame -- none of them survive python-for-android.
@@ -327,6 +483,16 @@ YOU ALSO DECLARE
     api = 24..35
     minapi = 21..30
 
+SELF-CHECK BEFORE YOU EMIT (you get no second chance -- a bad build costs 40 minutes)
+1. Every name you use is either defined in your own code, imported by you, or on the kit list above. No exceptions.
+2. Every Theme.<attr> you wrote is on the attribute list above, spelled exactly (they are lowercase).
+3. Every widget you construct exists and its keywords are real.
+4. build() returns a widget. The App subclass is instantiated and .run() is called.
+5. Nothing blocks: no input(), no time.sleep in the main thread, no while-True without a Clock.
+6. Every file path goes through user_data_dir.
+
+BE ECONOMICAL: write the app once, correctly. No commentary, no alternative versions, no explanations, no restating the requirements back. Code and the required sections only -- every extra word is wasted budget.
+
 OUTPUT FORMAT -- emit EXACTLY these sections in this order, NOTHING else (no prose, no code fences):
 <<<NAME>>>
 short_snake_case_slug
@@ -347,9 +513,10 @@ one or two terse lines: what it does / how to use it
 <<<END>>>
 """
 
-POLISH_PROMPT = """You are The Dawg (APK edition), a senior Android UI engineer. You are handed a working single-file Kivy app and must make it look like a premium Google-Play app WITHOUT changing what it does or breaking it.
+POLISH_PROMPT = """You are The Dawg (APK edition), a senior Android UI engineer. You are handed the APP portion of a working single-file Kivy app and must make it look like a premium Google-Play app WITHOUT changing what it does or breaking it.
 
-The file already contains the DAWG UI KIT between its markers (Theme, GradientBackground, AppBar, Card, PillButton, IconButton, TextField, Divider, heading, body, toast). DO NOT modify anything between the kit markers. Leave the kit byte-for-byte intact. Only restyle the APP code below the kit.
+""" + _KIT_CONTRACT + """
+You are shown the app code ONLY -- the kit sits above it and is already in scope. Return the app code ONLY. Never output the kit; if you do, the response is discarded and the round is wasted.
 
 Make these improvements:
 - Replace bare/default widgets with kit components (GradientBackground root, AppBar, Cards, PillButtons).
@@ -358,12 +525,18 @@ Make these improvements:
 - Keep it Kivy-only, keep all android imports guarded by platform, keep user_data_dir for saves, add no new external assets.
 - Do NOT change requirements/permissions unless the restyle truly needs it.
 
-Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the FULL updated file in <<<MAIN_PY>>> (kit included, unchanged). No prose, no fences."""
+Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the updated APP CODE ONLY in <<<MAIN_PY>>>. No kit, no prose, no fences."""
 
-FIX_PROMPT = """You are The Dawg (APK edition), a Kivy/Android debugging expert. You are given a single-file Kivy app and an error it produced (a syntax error, a Python traceback from a desktop test run, or a static-analysis finding). Fix the ROOT CAUSE so the app launches cleanly on Android and on desktop.
+FIX_PROMPT = """You are The Dawg (APK edition), a Kivy/Android debugging expert. You are given the APP portion of a single-file Kivy app and an error it produced (a syntax error, a Python traceback from a real headless test run, or a static-analysis finding). Fix the ROOT CAUSE so the app launches cleanly on Android and on desktop.
 
-The file contains the DAWG UI KIT between its markers. Keep the kit intact; fix the APP code (or wiring) below it. Common Android launch killers to check and fix:
-- Unguarded android-only imports (must be behind `if platform == "android":`).
+""" + _KIT_CONTRACT + """
+You are shown the app code ONLY -- the kit sits above it, unchanged and already in scope. Return the app code ONLY. Never output the kit.
+
+Line numbers in a traceback refer to the FULL file (kit + app). The kit is %d lines, so app line N appears as line N+%d in a traceback -- subtract before you go looking.
+
+Common Android launch killers to check and fix:
+- A Theme attribute or kit keyword that does not exist (check the API list above -- Theme attributes are lowercase).
+- Unguarded android-only imports (must be behind `if platform == "android":`).""" % (kit_line_offset(), kit_line_offset()) + """
 - A third-party import not listed in requirements (add it ONLY if it's in the allowed recipe set: pillow, requests, certifi, urllib3, idna, plyer, numpy; otherwise reimplement with stdlib/Kivy).
 - File writes to a relative path / cwd instead of user_data_dir.
 - References to image/sound files that don't exist (draw/generate instead).
@@ -371,7 +544,7 @@ The file contains the DAWG UI KIT between its markers. Keep the kit intact; fix 
 - Setting Window.size / Window.fullscreen in code.
 - Exceptions in __init__ / build().
 
-Keep behavior the same; just make it correct and robust. Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the FULL corrected file in <<<MAIN_PY>>>. No prose, no fences."""
+Change as little as possible -- fix the fault, do not rewrite working code, do not add features, do not explain. Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the corrected APP CODE ONLY in <<<MAIN_PY>>>. No kit, no prose, no fences."""
 
 # ----------------------------------------------------------------- helpers
 def slugify(s):
@@ -636,6 +809,8 @@ def analyze_code(code, requirements, permissions=""):
     Catches the real reasons a built APK installs but won't launch."""
     issues = []
     code = code or ""
+    if not code.strip():
+        return issues  # an empty editor isn't a problem, it's a starting point
     reqs = set(x.strip().lower() for x in (requirements or "").split(",") if x.strip())
     perms = set(x.strip().upper() for x in (permissions or "").replace(";", ",").split(",") if x.strip())
 
@@ -695,6 +870,15 @@ def analyze_code(code, requirements, permissions=""):
                 add("warn", "calls input() -> no stdin on Android, the app will hang",
                     "Take input via a TextField widget instead.")
                 break
+        # kit-API correctness + undefined symbols + Kivy runtime footguns
+        try:
+            kit_checks(tree, code, add, app_only=(KIT_END not in code))
+        except Exception as e:
+            add("info", "kit check skipped (%s)" % e)
+        try:
+            kivy_checks(tree, code, add)
+        except Exception as e:
+            add("info", "kivy check skipped (%s)" % e)
 
     # --- regex heuristics (work with or without a parse) ---
     if re.search(r"(?m)Window\.(size|fullscreen)\s*=", code):
@@ -727,6 +911,260 @@ def analyze_code(code, requirements, permissions=""):
     return out
 
 
+# ----------------------------------------------------------------- deeper static checks
+# v2's most common failure was not a Python bug -- it was the model calling a kit member
+# that doesn't exist. These checks catch that class of fault for free, before any build.
+_THEME_ALIASES = {
+    "BG": "bg", "BG2": "bg2", "SURFACE": "surface", "SURFACE2": "surface2",
+    "TXT": "text", "TEXT": "text", "FG": "text", "MUTED": "muted", "LINE": "line",
+    "ACCENT": "accent", "ACCENT2": "accent", "PRIMARY": "primary",
+    "PRIMARY_D": "primary_d", "GOOD": "ok", "OK": "ok", "SUCCESS": "ok",
+    "BAD": "danger", "DANGER": "danger", "ERROR": "danger", "WARN": "warn",
+    "WARNING": "warn", "ON_PRIMARY": "on_primary", "RADIUS": "radius",
+    "PAD": "pad", "PADDING": "pad", "GAP": "gap", "SPACING": "gap",
+}
+_KW_ALIASES = {
+    ("IconButton", "glyph"): "text", ("IconButton", "icon"): "text",
+    ("IconButton", "size"): "diameter", ("AppBar", "sub"): "subtitle",
+    ("AppBar", "caption"): "subtitle", ("TextField", "placeholder"): "hint",
+    ("TextField", "hint_text"): "hint", ("PillButton", "style"): "variant",
+    ("PillButton", "kind"): "variant", ("Card", "bg"): "fill",
+    ("Card", "color"): "fill", ("GradientBackground", "start"): "top",
+    ("GradientBackground", "end"): "bottom",
+}
+
+
+def theme_fix_for(attr):
+    """Best-guess correct spelling for a wrong Theme attribute, or None."""
+    if attr in KIT_INFO["theme_attrs"]:
+        return None
+    up = attr.upper()
+    if up in _THEME_ALIASES:
+        return _THEME_ALIASES[up]
+    low = attr.lower()
+    if low in KIT_INFO["theme_attrs"]:
+        return low
+    return None
+
+
+_BOUND_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _bound_names(tree):
+    """Every name bound anywhere in the file. Deliberately flat (not scope-aware) so the
+    undefined-name check stays conservative -- it should never cry wolf."""
+    names = set()
+
+    def bind_target(t):
+        if isinstance(t, ast.Name):
+            names.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                bind_target(e)
+        elif isinstance(t, ast.Starred):
+            bind_target(t.value)
+
+    for n in ast.walk(tree):
+        if isinstance(n, _BOUND_NODES):
+            names.add(n.name)
+            a = getattr(n, "args", None)
+            if a is not None:
+                for arg in list(a.args) + list(a.posonlyargs) + list(a.kwonlyargs):
+                    names.add(arg.arg)
+                if a.vararg:
+                    names.add(a.vararg.arg)
+                if a.kwarg:
+                    names.add(a.kwarg.arg)
+        elif isinstance(n, ast.Lambda):
+            a = n.args
+            for arg in list(a.args) + list(a.posonlyargs) + list(a.kwonlyargs):
+                names.add(arg.arg)
+            if a.vararg:
+                names.add(a.vararg.arg)
+            if a.kwarg:
+                names.add(a.kwarg.arg)
+        elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in targets:
+                bind_target(t)
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            bind_target(n.target)
+        elif isinstance(n, (ast.comprehension,)):
+            bind_target(n.target)
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for item in n.items:
+                if item.optional_vars is not None:
+                    bind_target(item.optional_vars)
+        elif isinstance(n, ast.ExceptHandler):
+            if n.name:
+                names.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            names.update(n.names)
+        elif isinstance(n, ast.Import):
+            for al in n.names:
+                names.add(al.asname or al.name.split(".")[0])
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                names.add(al.asname or al.name)
+        elif isinstance(n, ast.NamedExpr):
+            bind_target(n.target)
+    return names
+
+
+def _builtin_names():
+    import builtins
+    return set(dir(builtins)) | {"__name__", "__file__", "__doc__", "self", "cls"}
+
+
+def kit_checks(tree, code, add, app_only=False):
+    """Kit-API + symbol checks. app_only=True when the kit isn't in `code`."""
+    # --- wrong Theme attribute (the #1 v2 crash) ---
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "Theme":
+            if n.attr.startswith("_"):
+                continue
+            if n.attr not in KIT_INFO["theme_attrs"]:
+                sug = theme_fix_for(n.attr)
+                add("error",
+                    "Theme.%s does not exist -> AttributeError the moment that widget is built"
+                    % n.attr,
+                    ("Use Theme.%s instead." % sug) if sug else
+                    ("Valid attributes: " + ", ".join(THEME_ATTRS)))
+
+    # --- wrong keyword on a kit constructor ---
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+            continue
+        cls = n.func.id
+        if cls not in KIT_INFO["ctor_kwargs"]:
+            continue
+        allowed = KIT_INFO["ctor_kwargs"][cls] | KIVY_COMMON_KW
+        for kw in n.keywords:
+            if kw.arg is None or kw.arg in allowed:
+                continue
+            alias = _KW_ALIASES.get((cls, kw.arg))
+            if alias:
+                add("error",
+                    "%s(%s=...) is not a real keyword -> TypeError on construction"
+                    % (cls, kw.arg),
+                    "Use %s=... instead." % alias)
+            else:
+                add("warn",
+                    "%s(%s=...) isn't a kit keyword; it only works if Kivy's base widget "
+                    "happens to accept it" % (cls, kw.arg),
+                    "Kit keywords for %s: %s" % (cls, ", ".join(sorted(KIT_INFO["ctor_kwargs"][cls])) or "(none)"))
+
+    # --- undefined names (catches invented kit widgets and plain typos) ---
+    known = _bound_names(tree) | _builtin_names() | set(KIT_PUBLIC)
+    if app_only:
+        # everything the kit defines OR imports is in scope for the spliced-in app
+        known |= set(KIT_INFO["names"]) | set(KIT_INFO["imported"])
+    seen_bad = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            if n.id in known or n.id in seen_bad or n.id.startswith("__"):
+                continue
+            seen_bad.add(n.id)
+            hint = ""
+            low = n.id.lower()
+            for k in KIT_PUBLIC:
+                if k.lower() == low:
+                    hint = "Did you mean %s? (names are case-sensitive)" % k
+                    break
+            add("error", "'%s' is used but never defined or imported -> NameError" % n.id,
+                hint or "Define it, import it, or use a kit component (%s)."
+                % ", ".join(KIT_PUBLIC))
+
+
+def kivy_checks(tree, code, add):
+    """Kivy/Android runtime footguns that a syntax check can't see."""
+    # single-file constraint: no .kv files can ship
+    if re.search(r"Builder\.load_file\s*\(", code) or re.search(r"""['"][\w./-]+\.kv['"]""", code):
+        add("error", "loads an external .kv file -> the APK is built from a single main.py",
+            "Move the layout into Python, or use Builder.load_string() with an inline string.")
+    # shelling out doesn't exist on Android
+    for m in re.finditer(r"(?m)\b(os\.system|subprocess\.(?:run|Popen|call|check_output))\s*\(", code):
+        add("error", "calls %s -> there is no shell on Android, this raises or silently does nothing" % m.group(1),
+            "Do the work in Python, or use pyjnius behind an `if platform == \"android\":` guard.")
+        break
+    # blocking sleep on the UI thread freezes the app -> ANR
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and \
+                n.func.attr == "sleep" and isinstance(n.func.value, ast.Name) and n.func.value.id == "time":
+            add("warn", "calls time.sleep() -> if that's on the UI thread the app freezes and Android shows an ANR",
+                "Use Clock.schedule_once / Clock.schedule_interval instead.")
+            break
+    # Widget subclass that forgets to chain __init__
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.ClassDef):
+            continue
+        base_names = {b.id for b in n.bases if isinstance(b, ast.Name)}
+        base_names |= {b.attr for b in n.bases if isinstance(b, ast.Attribute)}
+        if not (base_names & {"Widget", "BoxLayout", "FloatLayout", "GridLayout", "Label",
+                              "Button", "Card", "GradientBackground", "RelativeLayout",
+                              "AnchorLayout", "StackLayout", "ScrollView", "Screen"}):
+            continue
+        for sub in n.body:
+            if not (isinstance(sub, ast.FunctionDef) and sub.name == "__init__"):
+                continue
+            chained = False
+            for c in ast.walk(sub):
+                if not isinstance(c, ast.Call):
+                    continue
+                f = c.func
+                # super().__init__(...)
+                if isinstance(f, ast.Attribute) and f.attr == "__init__":
+                    inner = f.value
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) \
+                            and inner.func.id == "super":
+                        chained = True
+                        break
+                    # Base.__init__(self, ...)
+                    if isinstance(inner, ast.Name):
+                        chained = True
+                        break
+            if not chained:
+                add("warn", "%s.__init__ never calls super().__init__(**kwargs) -> the widget "
+                            "won't accept size_hint/pos_hint and can render wrong" % n.name,
+                    "Start __init__ with super().__init__(**kwargs).")
+            break
+    # scheduling at 0 hammers the CPU and drains the battery
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and \
+                n.func.attr == "schedule_interval" and n.args and len(n.args) > 1:
+            iv = n.args[1]
+            if isinstance(iv, ast.Constant) and isinstance(iv.value, (int, float)) and iv.value <= 0:
+                add("warn", "Clock.schedule_interval(..., 0) runs every frame with no cap -> battery drain and jank",
+                    "Use 1/60.0 for animation, or a larger interval for logic.")
+                break
+    # mutable default argument
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in n.args.defaults:
+                if isinstance(d, (ast.List, ast.Dict, ast.Set)):
+                    add("warn", "%s() has a mutable default argument -> shared state between calls, "
+                                "a classic source of 'why is my list full of old data'" % n.name,
+                        "Default to None and create the container inside the function.")
+                    break
+    # background threads touching widgets
+    if re.search(r"threading\.Thread\s*\(", code) and "mainthread" not in code and \
+            "Clock.schedule_once" not in code:
+        add("warn", "starts a thread but never hands work back to the UI thread -> touching a widget "
+                    "from a thread corrupts the render and crashes on device",
+            "Import `from kivy.clock import mainthread` and decorate the UI callback, or use Clock.schedule_once.")
+    # exit paths that Android doesn't like
+    for m in re.finditer(r"(?m)\b(sys\.exit|exit|quit)\s*\(", code):
+        add("info", "calls %s() -> on Android, use App.get_running_app().stop() so the app closes cleanly" % m.group(1),
+            "Replace with App.get_running_app().stop().")
+        break
+    # bare except swallows the crash you're trying to debug
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ExceptHandler) and n.type is None:
+            add("info", "uses a bare `except:` -> hides real errors and makes device crashes impossible to trace",
+                "Catch `Exception as e` and log e.")
+            break
+
+
 def validate_code(code, requirements):
     """Return (errors, warnings) string lists. Back-compat surface for the build gate and
     the selftest; derived from analyze_code plus the original pygame/requirement checks."""
@@ -740,6 +1178,78 @@ def validate_code(code, requirements):
         if r not in SAFE_REQS:
             warnings_.append("requirement '%s' has no known p4a recipe -> build may fail" % r)
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings_))
+
+# ----------------------------------------------------------------- local auto-repair
+# Everything this function fixes costs ZERO tokens. It runs before any AI round, so the
+# expensive model is only ever asked about problems a deterministic pass can't solve.
+def auto_repair(code, requirements="", permissions=""):
+    """Return (code, requirements, permissions, [what_changed])."""
+    fixes = []
+    code = code or ""
+    reqs = [x.strip() for x in (requirements or "").split(",") if x.strip()]
+    perms = [x.strip().upper() for x in (permissions or "").replace(";", ",").split(",") if x.strip()]
+
+    # 1. wrong-case / aliased Theme attributes -> the real ones
+    def _theme_sub(m):
+        attr = m.group(1)
+        if attr in KIT_INFO["theme_attrs"]:
+            return m.group(0)
+        sug = theme_fix_for(attr)
+        if sug:
+            fixes.append("Theme.%s -> Theme.%s" % (attr, sug))
+            return "Theme." + sug
+        return m.group(0)
+    code = re.sub(r"Theme\.([A-Za-z_][A-Za-z0-9_]*)", _theme_sub, code)
+
+    # 2. aliased kit keywords -> the real ones
+    for (cls, bad), good in _KW_ALIASES.items():
+        pat = re.compile(r"(\b%s\s*\([^)]*?)\b%s\s*=" % (re.escape(cls), re.escape(bad)))
+        new, n = pat.subn(lambda m: m.group(1) + good + "=", code)
+        if n:
+            fixes.append("%s(%s=) -> %s(%s=) x%d" % (cls, bad, cls, good, n))
+            code = new
+
+    # 3. Buildozer owns sizing -- drop Window.size / Window.fullscreen assignments
+    out_lines, dropped = [], 0
+    for line in code.splitlines():
+        if re.match(r"^\s*Window\.(size|fullscreen)\s*=", line):
+            dropped += 1
+            continue
+        out_lines.append(line)
+    if dropped:
+        code = "\n".join(out_lines)
+        fixes.append("removed %d Window.size/fullscreen assignment(s) (Buildozer owns sizing)" % dropped)
+
+    # 4. declare recipes the code actually imports
+    low = {r.lower() for r in reqs}
+    try:
+        tree = ast.parse(code)
+        imports = _collect_imports(tree)
+    except Exception:
+        imports = {}
+    for root in imports:
+        req = IMPORT_TO_REQ.get(root)
+        if req and req not in low:
+            reqs.append(req)
+            low.add(req)
+            fixes.append("added '%s' to requirements (imported as %s)" % (req, root))
+
+    # 5. declare INTERNET when the app actually goes online
+    uses_net = bool(re.search(r"(?m)^\s*(?:import|from)\s+(?:requests|http\.client|urllib)\b", code)
+                    or "urlopen(" in code or "requests." in code)
+    if uses_net and "INTERNET" not in perms:
+        perms.append("INTERNET")
+        fixes.append("added INTERNET permission (the app makes network calls)")
+
+    # 6. a stray `if __name__` guard is the difference between running and not
+    if "class" in code and "App" in code and ".run()" not in code:
+        m = re.search(r"(?m)^class\s+(\w+)\s*\(\s*App\s*\)", code)
+        if m:
+            code = code.rstrip() + "\n\n\nif __name__ == \"__main__\":\n    %s().run()\n" % m.group(1)
+            fixes.append("appended the missing %s().run() entry point" % m.group(1))
+
+    return code, ",".join(dict.fromkeys(reqs)), ",".join(dict.fromkeys(perms)), fixes
+
 
 # ----------------------------------------------------------------- kit composition
 def compose(app_code):
@@ -906,7 +1416,11 @@ SMOKE_TEXT = (
 )
 
 # ---- manual-mode starters (app code; the kit is prepended when served/built) ----
-_T_BLANK = '''from kivy.app import App
+# Manual mode starts genuinely empty -- an empty editor, no kit, no scaffold, nothing
+# to delete before you start. The starters below are opt-in from the dropdown.
+_T_BLANK = ""
+
+_T_MIN = '''from kivy.app import App
 from kivy.uix.label import Label
 
 
@@ -1019,7 +1533,7 @@ class Board(Widget):
             self.vy = -self.vy
         self.canvas.clear()
         with self.canvas:
-            Color(*Theme.ACCENT)
+            Color(*Theme.accent)
             Ellipse(pos=(self.x_pos, self.y_pos), size=(self.r * 2, self.r * 2))
 
     def on_touch_down(self, touch):
@@ -1046,10 +1560,16 @@ if __name__ == "__main__":
 '''
 
 TEMPLATES = {
-    "blank": {"label": "Blank Kivy", "desc": "Minimal app, one label", "code": _T_BLANK},
-    "kit":   {"label": "Kit starter", "desc": "AppBar + Card + buttons (Dawg kit)", "code": _T_KIT},
-    "form":  {"label": "Form + list", "desc": "TextField that appends to a scrolling list", "code": _T_FORM},
-    "game":  {"label": "Game loop", "desc": "60fps canvas, touch + score", "code": _T_GAME},
+    "blank": {"label": "Blank", "desc": "Empty file. Nothing at all.",
+              "code": _T_BLANK, "kit": False},
+    "min":   {"label": "Minimal Kivy", "desc": "Plain Kivy app, one label, no kit",
+              "code": _T_MIN, "kit": False},
+    "kit":   {"label": "Kit starter", "desc": "AppBar + Card + buttons (Dawg kit)",
+              "code": _T_KIT, "kit": True},
+    "form":  {"label": "Form + list", "desc": "TextField that appends to a scrolling list",
+              "code": _T_FORM, "kit": True},
+    "game":  {"label": "Game loop", "desc": "60fps canvas, touch + score",
+              "code": _T_GAME, "kit": True},
 }
 
 # ----------------------------------------------------------------- AI
@@ -1086,7 +1606,76 @@ def _post_json(url, key, payload):
         return json.loads(r.read().decode("utf-8"))
 
 
-def call_ai(messages):
+def est_tokens(text):
+    """Cheap token estimate (~4 chars/token) for pre-flight sizing and cache stats."""
+    return max(1, len(text or "") // 4)
+
+
+def _cache_key(messages, model, max_tokens):
+    h = hashlib.sha256()
+    h.update((model or "").encode())
+    h.update(str(max_tokens).encode())
+    for msg in messages:
+        h.update((msg.get("role", "") + "\x00" + (msg.get("content") or "")).encode())
+    return h.hexdigest()[:32]
+
+
+def cache_get(key):
+    if not CONFIG.get("cache", True):
+        return None
+    try:
+        p = os.path.join(CACHEDIR, key + ".json")
+        if os.path.exists(p):
+            with open(p) as f:
+                d = json.load(f)
+            return d.get("text"), d.get("provider")
+    except Exception:
+        pass
+    return None
+
+
+def cache_put(key, text, provider):
+    if not CONFIG.get("cache", True):
+        return
+    try:
+        os.makedirs(CACHEDIR, exist_ok=True)
+        with open(os.path.join(CACHEDIR, key + ".json"), "w") as f:
+            json.dump({"text": text, "provider": provider, "at": time.time()}, f)
+        # keep the cache small: 200 newest entries
+        files = sorted(glob.glob(os.path.join(CACHEDIR, "*.json")), key=os.path.getmtime)
+        for old in files[:-200]:
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def cache_clear():
+    n = 0
+    for p in glob.glob(os.path.join(CACHEDIR, "*.json")):
+        try:
+            os.remove(p)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
+    """One metered, cached, budget-guarded model call."""
+    check_budget()
+    model = CONFIG.get("sf_model") or SF_MODEL
+    if max_tokens is None:
+        max_tokens = int(CONFIG.get("max_tokens") or 12000)
+    key = _cache_key(messages, model, max_tokens)
+    hit = cache_get(key)
+    if hit and hit[0]:
+        saved = sum(est_tokens(m.get("content")) for m in messages) + est_tokens(hit[0])
+        meter(0, 0, cached=True, saved=saved)
+        return hit[0], (hit[1] or "cache") + " [cached, 0 tokens]"
+
     sf = sf_key()
     gq = groq_key()
     errs = []
@@ -1094,10 +1683,16 @@ def call_ai(messages):
         sf_u = chat_url(CONFIG.get("sf_url") or SF_URL)
         try:
             d = _post_json(sf_u, sf, {
-                "model": CONFIG.get("sf_model") or SF_MODEL, "messages": messages,
-                "temperature": 0.4, "max_tokens": 16000,
+                "model": model, "messages": messages,
+                "temperature": temperature, "max_tokens": max_tokens,
             })
-            return d["choices"][0]["message"]["content"], "SiliconFlow / " + (CONFIG.get("sf_model") or SF_MODEL)
+            text = d["choices"][0]["message"]["content"]
+            u = d.get("usage") or {}
+            meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
+                  u.get("completion_tokens") or est_tokens(text))
+            prov = "SiliconFlow / " + model
+            cache_put(key, text, prov)
+            return text, prov
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode("utf-8")[:300]
@@ -1111,9 +1706,15 @@ def call_ai(messages):
         try:
             d = _post_json(gq_u, gq, {
                 "model": CONFIG.get("groq_model") or GROQ_MODEL, "messages": messages,
-                "temperature": 0.4, "max_tokens": 16000,
+                "temperature": temperature, "max_tokens": max_tokens,
             })
-            return d["choices"][0]["message"]["content"], "Groq (fallback)"
+            text = d["choices"][0]["message"]["content"]
+            u = d.get("usage") or {}
+            meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
+                  u.get("completion_tokens") or est_tokens(text))
+            prov = "Groq (fallback)"
+            cache_put(key, text, prov)
+            return text, prov
         except urllib.error.HTTPError as e:
             try:
                 body = e.read().decode("utf-8")[:300]
@@ -1127,45 +1728,67 @@ def call_ai(messages):
     raise RuntimeError(" | ".join(errs) or "AI call failed")
 
 
-def _recompute(payload):
-    """payload['main_py'] is a FULL file (kit + app). Heal the kit and recompute checks."""
+def _recompute(payload, repair=None):
+    """payload['main_py'] is a FULL file (kit + app). Optionally run the free local
+    repair pass, then heal the kit and recompute every check."""
     if not payload.get("ok"):
         return payload
+    if repair is None:
+        repair = bool(CONFIG.get("auto_repair", True))
     full = ensure_kit(payload["main_py"])
+    if repair:
+        app = strip_kit(full)
+        app, reqs, perms, fixes = auto_repair(app, payload.get("requirements", ""),
+                                              payload.get("permissions", ""))
+        if fixes:
+            full = with_kit(app)
+            payload["requirements"] = fix_requirements(reqs)
+            payload["permissions"] = clean_perms(perms)
+            payload["repairs"] = (payload.get("repairs") or []) + fixes
     payload["main_py"] = full
+    payload["app_py"] = strip_kit(full)
+    payload["kit_lines"] = kit_line_offset()
     payload["syntax_ok"], payload["syntax_msg"] = syntax_check(full)
     payload["errors"], payload["warnings"] = validate_code(full, payload.get("requirements", ""))
     payload["issues"] = analyze_code(full, payload.get("requirements", ""), payload.get("permissions", ""))
     return payload
 
 
-def ai_fix(main_py, error, requirements, permissions):
-    msg = "ERROR / FINDINGS:\n" + (error or "(none given)") + "\n\nCURRENT FILE (main.py):\n" + (main_py or "")
-    messages = [{"role": "system", "content": FIX_PROMPT}, {"role": "user", "content": msg}]
-    text, provider = call_ai(messages)
-    payload = build_forge_payload(text, "fix")
+def _finish_ai(payload, provider, requirements, permissions):
+    """Shared tail for fix/polish: the model returns APP CODE ONLY, we re-attach the kit."""
     if payload.get("ok"):
-        # the model returns the whole file incl. kit -> heal it back to canonical
-        payload["main_py"] = ensure_kit(payload["main_py"])
+        payload["main_py"] = with_kit(strip_kit(payload["main_py"]))
         if not payload.get("requirements"):
             payload["requirements"] = fix_requirements(requirements)
+        if not payload.get("permissions"):
+            payload["permissions"] = clean_perms(permissions)
         _recompute(payload)
     payload["provider"] = provider
+    payload["usage"] = dict(USAGE)
     return payload
+
+
+def ai_fix(main_py, error, requirements, permissions):
+    """Fix a fault. Sends APP CODE ONLY -- the 300-line kit never crosses the wire."""
+    app = strip_kit(main_py or "")
+    msg = ("ERROR / FINDINGS:\n" + (error or "(none given)")
+           + "\n\nDECLARED requirements: " + (requirements or "python3,kivy")
+           + "\nDECLARED permissions: " + (permissions or "(none)")
+           + "\n\nAPP CODE (the kit sits above this, unchanged and in scope):\n" + app)
+    messages = [{"role": "system", "content": FIX_PROMPT}, {"role": "user", "content": msg}]
+    # low temperature: a fix should be a fix, not a creative rewrite
+    text, provider = call_ai(messages, temperature=0.15, label="fix")
+    payload = build_forge_payload(text, "fix")
+    return _finish_ai(payload, provider, requirements, permissions)
 
 
 def ai_polish(main_py, requirements, permissions):
-    msg = "FILE TO RESTYLE (main.py):\n" + (main_py or "")
+    app = strip_kit(main_py or "")
+    msg = "APP CODE TO RESTYLE (the kit sits above this, unchanged and in scope):\n" + app
     messages = [{"role": "system", "content": POLISH_PROMPT}, {"role": "user", "content": msg}]
-    text, provider = call_ai(messages)
+    text, provider = call_ai(messages, temperature=0.35, label="polish")
     payload = build_forge_payload(text, "polish")
-    if payload.get("ok"):
-        payload["main_py"] = ensure_kit(payload["main_py"])
-        if not payload.get("requirements"):
-            payload["requirements"] = fix_requirements(requirements)
-        _recompute(payload)
-    payload["provider"] = provider
-    return payload
+    return _finish_ai(payload, provider, requirements, permissions)
 
 
 # ----------------------------------------------------------------- build worker
@@ -1243,43 +1866,223 @@ def run_build(build_id, project_dir):
 
 
 # ----------------------------------------------------------------- headless test worker
-_RUNNER = r'''import os, sys, threading, traceback
+_RUNNER = r'''"""Phased self-test harness.
+
+v2 ran the app for two seconds and called it a pass. That misses everything that only
+breaks when a user actually touches the thing. This drives the app through the phases a
+real launch goes through, reports each one separately, and never lets one phase's
+failure hide another's result.
+"""
+import os, sys, threading, traceback
+
+PHASES = []          # (name, ok, detail)
+LIVE_ERRORS = []     # exceptions raised from callbacks/clock during the soak
+
+def _trim(detail, limit=600):
+    """Keep the TAIL of a traceback -- the exception type and message live at the end,
+    and that is the only part a fix round actually needs."""
+    d = (detail or "").strip()
+    if len(d) <= limit:
+        return d
+    return "..." + d[-limit:]
+
+def phase(name, ok, detail=""):
+    PHASES.append((name, ok, detail))
+    print("DAWG_PHASE\t%s\t%s\t%s" % (name, "ok" if ok else "fail",
+                                      _trim(detail).replace("\n", " | ")))
+    sys.stdout.flush()
 
 def _watchdog():
     import time
-    time.sleep(25)
+    time.sleep(40)
     sys.stderr.write("DAWG_TEST_TIMEOUT\n")
     sys.stderr.flush()
     os._exit(124)
 
 threading.Thread(target=_watchdog, daemon=True).start()
 
+def _hook(exc_type, exc, tb):
+    LIVE_ERRORS.append("".join(traceback.format_exception(exc_type, exc, tb)))
+sys.excepthook = _hook
+threading.excepthook = lambda a: LIVE_ERRORS.append(
+    "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+
+# ---------------------------------------------------------------- phase 1: compile
+src = ""
 try:
-    from kivy.app import App
-    from kivy.clock import Clock
-    _orig = App.run
-    def _patched(self, *a, **k):
-        # let it draw a couple frames, then stop so run() returns
-        Clock.schedule_once(lambda *_: self.stop(), 2.0)
-        return _orig(self, *a, **k)
-    App.run = _patched
+    with open("main.py") as f:
+        src = f.read()
+    code_obj = compile(src, "main.py", "exec")
+    phase("compile", True)
 except Exception:
-    traceback.print_exc()
+    phase("compile", False, traceback.format_exc())
+    print("DAWG_TEST_FAIL"); os._exit(1)
+
+# ---------------------------------------------------------------- phase 2: import
+# Run the module with .run() neutralised so we control the lifecycle ourselves.
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.base import EventLoop
+
+_captured = {"app": None}
+_real_run = App.run
+def _capture_run(self, *a, **k):
+    _captured["app"] = self
+App.run = _capture_run
 
 ns = {"__name__": "__main__", "__file__": "main.py"}
 try:
-    with open("main.py", "r") as f:
-        src = f.read()
-    exec(compile(src, "main.py", "exec"), ns)
-    print("DAWG_TEST_OK")
-    os._exit(0)
+    exec(code_obj, ns)
+    phase("import", True)
 except SystemExit:
-    print("DAWG_TEST_OK")
-    os._exit(0)
+    phase("import", True, "module called sys.exit")
 except Exception:
-    traceback.print_exc()
+    phase("import", False, traceback.format_exc())
+    print("DAWG_TEST_FAIL"); os._exit(1)
+
+# find the App: the one .run() captured, else the first App subclass defined
+app = _captured["app"]
+if app is None:
+    for v in ns.values():
+        if isinstance(v, type) and issubclass(v, App) and v is not App:
+            try:
+                app = v()
+            except Exception:
+                phase("instantiate", False, traceback.format_exc())
+                print("DAWG_TEST_FAIL"); os._exit(1)
+            break
+if app is None:
+    phase("instantiate", False, "no App subclass found and .run() was never called")
+    print("DAWG_TEST_FAIL"); os._exit(1)
+phase("instantiate", True, type(app).__name__)
+
+# ---------------------------------------------------------------- phase 3: build()
+root = None
+try:
+    App.run = _real_run
+    EventLoop.ensure_window()
+    root = app.build()
+    if root is None:
+        # some apps build via kv / load_kv; tolerate but note it
+        phase("build", True, "build() returned None (kv-driven or root set elsewhere)")
+    else:
+        app.root = root
+        Window.add_widget(root)
+        phase("build", True, type(root).__name__)
+except Exception:
+    phase("build", False, traceback.format_exc())
+    print("DAWG_TEST_FAIL"); os._exit(1)
+
+def _walk(w, depth=0):
+    yield w, depth
+    for c in list(getattr(w, "children", []) or []):
+        for item in _walk(c, depth + 1):
+            yield item
+
+widgets = list(_walk(root)) if root is not None else []
+phase("widget_tree", True, "%d widgets, depth %d"
+      % (len(widgets), max([d for _, d in widgets], default=0)))
+
+# ---------------------------------------------------------------- phase 4: render
+def pump(n=3):
+    for _ in range(n):
+        EventLoop.idle()
+
+try:
+    pump(4)
+    phase("render", True, "4 frames drawn")
+except Exception:
+    phase("render", False, traceback.format_exc())
+
+# ---------------------------------------------------------------- phase 5: touch
+# Press every button in the tree. This is where "works on my screen" apps fall over:
+# a handler that references a missing attribute only blows up on the first tap.
+class _T:
+    def __init__(self, x, y):
+        self.x = x; self.y = y; self.pos = (x, y)
+        self.spos = (0, 0); self.opos = (x, y); self.dpos = (0, 0)
+        self.profile = ["pos"]; self.ud = {}; self.is_touch = True
+        self.grab_current = None; self.button = "left"; self.time_start = 0
+        self.dx = self.dy = 0; self.osx = self.osy = 0
+        self.push_attrs = ()
+    def grab(self, *a, **k): pass
+    def ungrab(self, *a, **k): pass
+    def push(self, *a, **k): pass
+    def pop(self, *a, **k): pass
+
+tapped, tap_errors = 0, []
+try:
+    from kivy.uix.behaviors import ButtonBehavior
+    from kivy.uix.button import Button as _Btn
+    for w, _d in widgets:
+        if not isinstance(w, (_Btn, ButtonBehavior)):
+            continue
+        try:
+            w.dispatch("on_press")
+            w.dispatch("on_release")
+            tapped += 1
+            pump(1)
+        except Exception:
+            tb = traceback.format_exc().strip().splitlines()
+            # drop the harness frames; keep the app frames and the exception line
+            useful = [l for l in tb if "__dawg_run.py" not in l and "kivy/_event" not in l]
+            tap_errors.append("%s (label %r): %s"
+                              % (type(w).__name__, getattr(w, "text", "")[:24],
+                                 " | ".join(useful[-4:])))
+    if tap_errors:
+        phase("touch", False, "%d/%d handlers raised -- %s"
+              % (len(tap_errors), tapped + len(tap_errors), " ;; ".join(tap_errors[:3])))
+    else:
+        phase("touch", True, "%d button(s) pressed cleanly" % tapped)
+except Exception:
+    phase("touch", False, traceback.format_exc())
+
+# ---------------------------------------------------------------- phase 6: rotate
+try:
+    w0, h0 = Window.size
+    Window.size = (h0, w0)
+    pump(2)
+    Window.size = (w0, h0)
+    pump(2)
+    phase("rotate", True, "survived a portrait<->landscape flip")
+except Exception:
+    phase("rotate", False, traceback.format_exc())
+
+# ---------------------------------------------------------------- phase 7: soak
+try:
+    on_start = getattr(app, "on_start", None)
+    if callable(on_start):
+        on_start()
+    import time as _t
+    t_end = _t.time() + 3.0
+    frames = 0
+    while _t.time() < t_end:
+        EventLoop.idle()
+        frames += 1
+    if LIVE_ERRORS:
+        phase("soak", False, "%d exception(s) from timers/callbacks\n%s"
+              % (len(LIVE_ERRORS), LIVE_ERRORS[0][:600]))
+    else:
+        phase("soak", True, "%d frames over 3s, no callback exceptions" % frames)
+except Exception:
+    phase("soak", False, traceback.format_exc())
+
+# ---------------------------------------------------------------- phase 8: teardown
+try:
+    stop = getattr(app, "on_stop", None)
+    if callable(stop):
+        stop()
+    phase("teardown", True)
+except Exception:
+    phase("teardown", False, traceback.format_exc())
+
+failed = [p for p in PHASES if not p[1]]
+if failed:
     print("DAWG_TEST_FAIL")
     os._exit(1)
+print("DAWG_TEST_OK")
+os._exit(0)
 '''
 
 _BENIGN = ("Cutbuffer", "xclip", "xsel", "Unable to open the clipboard",
@@ -1330,10 +2133,10 @@ def run_test(test_id, main_py, requirements):
     env = dict(os.environ, KIVY_NO_ARGS="1", KIVY_LOG_LEVEL="warning",
                PYTHONUNBUFFERED="1", KIVY_NO_CONSOLELOG="0")
     log("$ " + " ".join(cmd))
-    log("(running the app headless for ~2s to catch launch crashes)")
+    log("(self-test: compile -> import -> build -> render -> tap every button -> rotate -> 3s soak)")
     log("")
     try:
-        proc = subprocess.run(cmd, cwd=tdir, env=env, capture_output=True, text=True, timeout=45)
+        proc = subprocess.run(cmd, cwd=tdir, env=env, capture_output=True, text=True, timeout=75)
         out = (proc.stdout or "") + (proc.stderr or "")
         rc = proc.returncode
     except subprocess.TimeoutExpired:
@@ -1352,33 +2155,199 @@ def run_test(test_id, main_py, requirements):
         log(rec["summary"])
         return
 
+    # pull the structured phase report out of the stream
+    phases = []
+    for line in out.splitlines():
+        if line.startswith("DAWG_PHASE\t"):
+            parts = line.split("\t")
+            while len(parts) < 4:
+                parts.append("")
+            phases.append({"name": parts[1], "ok": parts[2] == "ok", "detail": parts[3]})
+    rec["phases"] = phases
+
+    if phases:
+        log("--- self-test phases ---")
+        for p in phases:
+            log("  [%s] %-12s %s" % ("PASS" if p["ok"] else "FAIL", p["name"], p["detail"]))
+        log("")
+
     # surface non-benign output lines
     for line in out.splitlines():
+        if line.startswith("DAWG_PHASE\t"):
+            continue
         if line.strip() and not any(b in line for b in _BENIGN):
             log(line)
 
     has_tb = "Traceback (most recent call last)" in out
     miss = _missing_module(out)
+    failed = [p for p in phases if not p["ok"]]
     if rc == 124 or "DAWG_TEST_TIMEOUT" in out:
         rec["status"] = "timeout"
-        rec["summary"] = "the app hung (no clean exit) -- likely a blocking loop or input() that would ANR on the phone."
+        rec["summary"] = ("the app hung (no clean exit) -- likely a blocking loop or input() "
+                          "that would ANR on the phone.")
     elif miss and miss in ANDROID_ONLY:
         rec["status"] = "warn"
         rec["summary"] = "imports the android-only module '%s', which can't run on desktop. That's expected -- just make sure the import is guarded by `if platform == \"android\":` so desktop test runs (and the launch path) skip it." % miss
     elif miss and miss in {x.strip().lower() for x in (requirements or "").split(",")} and miss in SAFE_REQS:
         rec["status"] = "warn"
         rec["summary"] = "host is missing '%s', so it couldn't be fully test-run here, but it IS declared and Buildozer will bundle it into the APK. Looks fine to build." % miss
+    elif failed:
+        rec["status"] = "fail"
+        names = ", ".join(p["name"] for p in failed)
+        rec["summary"] = ("self-test failed at: %s. The detail above is the real traceback -- "
+                          "hit AUTO-FIX to send it back for a targeted fix." % names)
+        rec["error_text"] = "\n\n".join(
+            "phase '%s' failed: %s" % (p["name"], p["detail"]) for p in failed)
     elif has_tb or rc not in (0,):
         rec["status"] = "fail"
-        rec["summary"] = "the app crashed on launch (traceback above). Hit AUTO-FIX to send the error back for a fix, or fix it in the editor."
+        rec["summary"] = "the app crashed (traceback above). Hit AUTO-FIX to send the error back for a fix."
+        rec["error_text"] = out[-4000:]
     elif "DAWG_TEST_OK" in out:
         rec["status"] = "pass"
-        rec["summary"] = "launched clean and ran for ~2s with no crash. Good to build."
+        n = len(phases)
+        rec["summary"] = ("all %d self-test phases passed -- it builds its UI, survives taps, "
+                          "a rotation and a 3s soak with no exceptions. Good to build." % n)
     else:
         rec["status"] = "warn"
         rec["summary"] = "finished without a clear pass/fail signal. Review the output above."
     log("")
     log(rec["summary"])
+
+# ----------------------------------------------------------------- agent loop
+# The pipeline the app used to make you drive by hand: forge -> repair -> lint ->
+# self-test -> fix -> repeat. Every round tries the FREE local repair first and only
+# pays for a model call when the fault genuinely needs one.
+def _job_log(rec, text, kind="info"):
+    rec["steps"].append({"t": time.time(), "kind": kind, "text": text})
+    if len(rec["steps"]) > 400:
+        del rec["steps"][:100]
+
+
+def _run_selftest_sync(main_py, requirements):
+    """Run the phased harness inline and return the TESTS record."""
+    tid = "job" + uuid.uuid4().hex[:8]
+    TESTS[tid] = {"log": [], "status": "running", "summary": "", "phases": []}
+    run_test(tid, main_py, requirements)
+    return TESTS[tid]
+
+
+def run_agent(job_id, desc, seed_payload=None, rounds=None):
+    rec = JOBS[job_id]
+    if rounds is None:
+        rounds = int(CONFIG.get("agent_rounds") or 3)
+    rounds = max(1, min(6, int(rounds)))
+    try:
+        # ---- round 0: get code on the table -------------------------------------
+        if seed_payload is not None:
+            payload = seed_payload
+            _job_log(rec, "starting from the code already in the editor", "step")
+        else:
+            _job_log(rec, "forging from your description...", "step")
+            messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": desc}]
+            text, provider = call_ai(messages, temperature=0.4, label="forge")
+            payload = build_forge_payload(text, desc)
+            if not payload.get("ok"):
+                rec["status"] = "failed"
+                rec["error"] = payload.get("error", "the model returned no usable app")
+                _job_log(rec, rec["error"], "fail")
+                return
+            payload["main_py"] = with_kit(payload["main_py"])
+            payload["provider"] = provider
+            _recompute(payload)
+            _job_log(rec, "forged '%s' via %s" % (payload.get("title") or "app", provider), "ok")
+        rec["payload"] = payload
+
+        for rnd in range(1, rounds + 1):
+            rec["round"] = rnd
+            # ---- free local repair --------------------------------------------
+            if payload.get("repairs"):
+                for f in payload["repairs"]:
+                    _job_log(rec, "repaired locally (0 tokens): " + f, "ok")
+                payload["repairs"] = []
+
+            # ---- static gate ---------------------------------------------------
+            hard = [i for i in payload.get("issues", []) if i["sev"] == "error"]
+            if not payload.get("syntax_ok"):
+                findings = "SYNTAX: " + (payload.get("syntax_msg") or "")
+                _job_log(rec, "syntax error: " + (payload.get("syntax_msg") or ""), "fail")
+            elif hard:
+                findings = "\n".join("- %s (%s)" % (i["msg"], i["fix"]) for i in hard)
+                _job_log(rec, "%d blocking issue(s) static analysis can't fix itself" % len(hard), "warn")
+            else:
+                findings = ""
+                _job_log(rec, "static analysis clean", "ok")
+
+            # ---- self-test -----------------------------------------------------
+            if not findings:
+                if not host_can_test():
+                    _job_log(rec, "self-test skipped (no kivy/xvfb on this host) -- "
+                                  "static analysis passed, so it's ready to build", "warn")
+                    rec["status"] = "done"
+                    rec["payload"] = payload
+                    return
+                _job_log(rec, "running the self-test (build, tap, rotate, soak)...", "step")
+                t = _run_selftest_sync(payload["main_py"], payload.get("requirements", ""))
+                rec["phases"] = t.get("phases", [])
+                rec["test_status"] = t.get("status")
+                for p in t.get("phases", []):
+                    _job_log(rec, "%s %s%s" % ("PASS" if p["ok"] else "FAIL", p["name"],
+                                               (" - " + p["detail"]) if p["detail"] else ""),
+                             "ok" if p["ok"] else "fail")
+                if t.get("status") in ("pass", "warn", "skipped"):
+                    _job_log(rec, t.get("summary", "self-test finished"), "ok")
+                    rec["status"] = "done"
+                    rec["payload"] = payload
+                    return
+                findings = t.get("error_text") or t.get("summary") or "the self-test failed"
+
+            # ---- last round? stop before paying for a fix we can't verify -------
+            if rnd >= rounds:
+                _job_log(rec, "out of rounds -- stopping here so it doesn't keep spending. "
+                              "Review the findings and hit AUTO-FIX if you want another go.", "warn")
+                rec["status"] = "stalled"
+                rec["payload"] = payload
+                return
+
+            # ---- pay for a fix --------------------------------------------------
+            before = payload["main_py"]
+            _job_log(rec, "asking the model for a targeted fix (round %d/%d)" % (rnd, rounds), "step")
+            try:
+                fixed = ai_fix(payload["main_py"], findings,
+                               payload.get("requirements", ""), payload.get("permissions", ""))
+            except Exception as e:
+                rec["status"] = "failed"
+                rec["error"] = str(e)
+                _job_log(rec, "fix call failed: %s" % e, "fail")
+                rec["payload"] = payload
+                return
+            if not fixed.get("ok"):
+                _job_log(rec, "the model's fix didn't parse -- keeping the previous version", "fail")
+                rec["status"] = "stalled"
+                rec["payload"] = payload
+                return
+            # keep identity from the original forge; a fix shouldn't rename the app
+            for k in ("name", "title", "orientation"):
+                if payload.get(k):
+                    fixed[k] = payload[k]
+            if strip_kit(fixed["main_py"]).strip() == strip_kit(before).strip():
+                _job_log(rec, "the model returned identical code -- it can't fix this one. "
+                              "Stopping rather than paying for the same answer again.", "warn")
+                rec["status"] = "stalled"
+                rec["payload"] = fixed
+                return
+            payload = fixed
+            rec["payload"] = payload
+            _job_log(rec, "fix applied, re-checking", "ok")
+
+        rec["status"] = "stalled"
+    except Exception as e:
+        rec["status"] = "failed"
+        rec["error"] = str(e)
+        _job_log(rec, "agent error: %s" % e, "fail")
+    finally:
+        rec["usage"] = dict(USAGE)
+
 
 # ----------------------------------------------------------------- server helpers
 def safe_archs(a):
@@ -1387,9 +2356,19 @@ def safe_archs(a):
     return ",".join(dict.fromkeys(parts)) or ANDROID_ARCHS
 
 
-def manual_payload(name, code, title="", requirements="python3,kivy", permissions="", orientation="portrait"):
-    """Wrap hand-written / template app code into a forge-shaped payload (kit prepended)."""
-    full = with_kit(code or "")
+def manual_payload(name, code, title="", requirements="python3,kivy", permissions="",
+                   orientation="portrait", kit=True, repair=False):
+    """Wrap hand-written / template app code into a forge-shaped payload.
+
+    kit=False means the file is exactly what you typed -- no kit, no scaffold. That's
+    what MANUAL mode opens with, so a blank editor really is a blank file.
+    """
+    code = code or ""
+    full = with_kit(code) if kit else code
+    if repair:
+        base = strip_kit(full) if kit else full
+        base, requirements, permissions, _fx = auto_repair(base, requirements, permissions)
+        full = with_kit(base) if kit else base
     sok, smsg = syntax_check(full)
     reqs = fix_requirements(requirements)
     errs, warns = validate_code(full, reqs)
@@ -1399,9 +2378,12 @@ def manual_payload(name, code, title="", requirements="python3,kivy", permission
         "ok": True, "name": nm, "title": (title or nm.replace("_", " ").title()),
         "orientation": orientation if orientation in ("portrait", "landscape", "all") else "portrait",
         "requirements": reqs, "permissions": clean_perms(permissions), "notes": "",
-        "main_py": full, "syntax_ok": sok, "syntax_msg": smsg,
+        "main_py": full, "app_py": strip_kit(full) if kit else full,
+        "kit": bool(kit), "kit_lines": kit_line_offset() if kit else 0,
+        "syntax_ok": sok, "syntax_msg": smsg,
         "errors": errs, "warnings": warns, "issues": issues,
-        "build_overrides": {}, "build_warnings": [], "provider": "template (no AI)",
+        "build_overrides": {}, "build_warnings": [], "provider": "local (no AI, 0 tokens)",
+        "usage": dict(USAGE),
     }
 
 
@@ -1464,6 +2446,8 @@ class H(BaseHTTPRequestHandler):
                 "status": rec["status"],
                 "log": "\n".join(rec["log"][-800:]),
                 "summary": rec.get("summary", ""),
+                "phases": rec.get("phases", []),
+                "error_text": rec.get("error_text", ""),
             })
         if path == "/api/apk":
             qs = parse_qs(urlparse(self.path).query)
@@ -1479,7 +2463,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"checks": doctor(), "can_test": host_can_test()})
         if path == "/api/templates":
             return self._send(200, {"templates": [
-                {"id": k, "label": v["label"], "desc": v["desc"]} for k, v in TEMPLATES.items()
+                {"id": k, "label": v["label"], "desc": v["desc"], "kit": v.get("kit", True)}
+                for k, v in TEMPLATES.items()
             ]})
         if path == "/api/template":
             qs = parse_qs(urlparse(self.path).query)
@@ -1487,7 +2472,27 @@ class H(BaseHTTPRequestHandler):
             t = TEMPLATES.get(tid)
             if not t:
                 return self._send(404, {"error": "no such template"})
-            return self._send(200, manual_payload(tid, t["code"]))
+            return self._send(200, manual_payload(tid if tid != "blank" else "app",
+                                                  t["code"], kit=t.get("kit", True)))
+        if path == "/api/usage":
+            return self._send(200, {
+                "usage": dict(USAGE),
+                "budget": int(CONFIG.get("token_budget") or 0),
+                "left": budget_left(),
+                "kit_lines": kit_line_offset(),
+            })
+        if path == "/api/job":
+            qs = parse_qs(urlparse(self.path).query)
+            jid = (qs.get("id") or [""])[0]
+            rec = JOBS.get(jid)
+            if not rec:
+                return self._send(404, {"error": "no such job"})
+            return self._send(200, {
+                "status": rec["status"], "round": rec.get("round", 0),
+                "steps": rec["steps"][-160:], "payload": rec.get("payload"),
+                "phases": rec.get("phases", []), "error": rec.get("error", ""),
+                "usage": dict(USAGE),
+            })
         if path == "/api/smoketest":
             payload = build_forge_payload(SMOKE_TEXT, "smoke test")
             if payload.get("ok"):
@@ -1505,6 +2510,11 @@ class H(BaseHTTPRequestHandler):
                 "sf_url": CONFIG.get("sf_url") or SF_URL,
                 "groq_model": CONFIG.get("groq_model") or GROQ_MODEL,
                 "groq_url": CONFIG.get("groq_url") or GROQ_URL,
+                "max_tokens": int(CONFIG.get("max_tokens") or 12000),
+                "token_budget": int(CONFIG.get("token_budget") or 0),
+                "cache": bool(CONFIG.get("cache", True)),
+                "auto_repair": bool(CONFIG.get("auto_repair", True)),
+                "agent_rounds": int(CONFIG.get("agent_rounds") or 3),
             })
         if path in ("/icon.png", "/favicon.ico", "/favicon.png", "/apple-touch-icon.png"):
             try:
@@ -1523,6 +2533,22 @@ class H(BaseHTTPRequestHandler):
             body = {}
         if path == "/api/forge":
             return self.handle_forge(body)
+        if path == "/api/autoforge":
+            return self.handle_autoforge(body)
+        if path == "/api/lint":
+            return self.handle_lint(body)
+        if path == "/api/repair":
+            return self.handle_repair(body)
+        if path == "/api/manual":
+            return self._send(200, manual_payload(
+                body.get("name", "app"), body.get("main_py", ""),
+                title=body.get("title", ""),
+                requirements=body.get("requirements", "python3,kivy"),
+                permissions=body.get("permissions", ""),
+                orientation=body.get("orientation", "portrait"),
+                kit=bool(body.get("kit", False))))
+        if path == "/api/cache_clear":
+            return self._send(200, {"removed": cache_clear()})
         if path == "/api/build":
             return self.handle_build(body)
         if path == "/api/testrun":
@@ -1558,6 +2584,16 @@ class H(BaseHTTPRequestHandler):
             CONFIG["groq_model"] = body["groq_model"].strip()
         if "groq_url" in body:
             CONFIG["groq_url"] = (body.get("groq_url") or "").strip() or GROQ_URL
+        for k, lo, hi in (("max_tokens", 1000, 32000), ("token_budget", 0, 100000000),
+                          ("agent_rounds", 1, 6)):
+            if k in body:
+                try:
+                    CONFIG[k] = max(lo, min(hi, int(body[k] or 0)))
+                except Exception:
+                    pass
+        for k in ("cache", "auto_repair"):
+            if k in body:
+                CONFIG[k] = bool(body[k])
         ok = save_config(CONFIG)
         return self._send(200, {
             "saved": ok,
@@ -1565,16 +2601,77 @@ class H(BaseHTTPRequestHandler):
             "groq_key_set": bool(groq_key()),
         })
 
+    def handle_lint(self, body):
+        """Instant, free static analysis -- powers live feedback while you type."""
+        code = body.get("main_py") or ""
+        reqs = fix_requirements(body.get("requirements", ""))
+        perms = clean_perms(body.get("permissions", ""))
+        sok, smsg = syntax_check(code)
+        issues = analyze_code(code, reqs, perms) if code.strip() else []
+        errs = [i["msg"] for i in issues if i["sev"] == "error"]
+        return self._send(200, {
+            "syntax_ok": sok, "syntax_msg": smsg, "issues": issues,
+            "errors": errs, "warnings": [i["msg"] for i in issues if i["sev"] == "warn"],
+            "kit_lines": kit_line_offset() if KIT_END in code else 0,
+        })
+
+    def handle_repair(self, body):
+        """Run the free local repair pass and hand back what changed."""
+        code = body.get("main_py") or ""
+        has_kit = KIT_END in code
+        app = strip_kit(code) if has_kit else code
+        app, reqs, perms, fixes = auto_repair(app, body.get("requirements", ""),
+                                              body.get("permissions", ""))
+        full = with_kit(app) if has_kit else app
+        payload = {
+            "ok": True, "main_py": full, "app_py": app,
+            "name": slugify(body.get("name", "app")),
+            "title": body.get("title", "") or slugify(body.get("name", "app")).replace("_", " ").title(),
+            "orientation": body.get("orientation", "portrait"),
+            "requirements": fix_requirements(reqs), "permissions": clean_perms(perms),
+            "notes": "", "build_overrides": {}, "build_warnings": [],
+            "repairs": fixes, "provider": "local repair (0 tokens)",
+        }
+        _recompute(payload, repair=False)
+        payload["usage"] = dict(USAGE)
+        return self._send(200, payload)
+
+    def handle_autoforge(self, body):
+        desc = (body.get("description") or "").strip()
+        seed = None
+        if body.get("main_py"):
+            seed = manual_payload(body.get("name", "app"), strip_kit(body["main_py"]),
+                                  title=body.get("title", ""),
+                                  requirements=body.get("requirements", "python3,kivy"),
+                                  permissions=body.get("permissions", ""),
+                                  orientation=body.get("orientation", "portrait"),
+                                  kit=True)
+        elif not desc:
+            return self._send(400, {"error": "give me a description or some code to work on"})
+        jid = uuid.uuid4().hex[:12]
+        JOBS[jid] = {"status": "running", "steps": [], "round": 0, "payload": None}
+        threading.Thread(target=run_agent,
+                         args=(jid, desc, seed, body.get("rounds")), daemon=True).start()
+        return self._send(200, {"job_id": jid})
+
     def handle_forge(self, body):
         desc = (body.get("description") or "").strip()
-        history = body.get("history") or []
         if not desc:
             return self._send(400, {"error": "empty description"})
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages += history[-8:]
-        messages += [{"role": "user", "content": desc}]
+        # TOKEN DISCIPLINE: v2 replayed every previous full response (kit and all) into
+        # every follow-up, so a fourth refine cost four whole apps. Now the context is
+        # the short user turns plus the CURRENT app code once, kit stripped.
+        for turn in (body.get("history") or [])[-6:]:
+            if turn.get("role") == "user" and turn.get("content"):
+                messages.append({"role": "user", "content": str(turn["content"])[:600]})
+        cur = strip_kit(body.get("main_py") or "")
+        if cur.strip():
+            messages.append({"role": "assistant",
+                             "content": "<<<MAIN_PY>>>\n" + cur + "\n<<<END>>>"})
+        messages.append({"role": "user", "content": desc})
         try:
-            text, provider = call_ai(messages)
+            text, provider = call_ai(messages, temperature=0.4, label="forge")
         except Exception as e:
             return self._send(502, {"error": str(e)})
         payload = build_forge_payload(text, desc)
@@ -1582,6 +2679,7 @@ class H(BaseHTTPRequestHandler):
             payload["main_py"] = with_kit(payload["main_py"])
             _recompute(payload)
         payload["provider"] = provider
+        payload["usage"] = dict(USAGE)
         return self._send(200, payload)
 
     def handle_fix(self, body):
@@ -1758,306 +2856,592 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>THE DAWG // APK FORGE</title>
 <link rel="icon" type="image/png" href="/icon.png">
-<link rel="shortcut icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <style>
   :root{
-    --bg:#080b08; --panel:#0e130e; --panel2:#121912; --line:#1d271d;
-    --txt:#d6e6d6; --muted:#6e8070; --green:#49d367; --cyan:#36c7e2;
-    --danger:#ff5d5d; --amber:#e8b341;
+    --bg:#070a0e; --bg2:#0a0f15; --panel:#0e141c; --panel2:#131b25; --panel3:#182231;
+    --line:#1e2a3a; --line2:#2a3a4f;
+    --txt:#e2ecf7; --muted:#7b8da0; --dim:#546274;
+    --green:#3ddc84; --cyan:#43c8f5; --violet:#8b7cf6;
+    --danger:#ff5f6d; --amber:#ffb340;
+    --r:12px; --r2:16px;
+    --sh:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"JetBrains Mono","DejaVu Sans Mono",monospace;
+    --ui:system-ui,-apple-system,"Segoe UI",Inter,Roboto,"Helvetica Neue",sans-serif;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--txt);
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;
-    font-size:14px;line-height:1.45}
-  header{display:flex;align-items:center;gap:12px;padding:14px 18px;
-    border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0c110c,#080b08);
-    position:sticky;top:0;z-index:20}
-  header .dot{width:10px;height:10px;border-radius:50%;background:var(--green);
-    box-shadow:0 0 10px var(--green)}
-  header h1{font-size:15px;letter-spacing:2px;margin:0;font-weight:700}
-  header h1 span{color:var(--cyan)}
-  header h1 .ver{color:var(--muted);font-size:10px;font-weight:400;letter-spacing:1px}
-  header .spacer{margin-left:auto}
-  #doctor{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:540px}
-  main{max-width:1020px;margin:0 auto;padding:18px}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:14px;margin-bottom:16px}
-  label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px;letter-spacing:1px}
-  textarea,input[type=text],.codebox,select{width:100%;background:var(--panel2);color:var(--txt);
-    border:1px solid var(--line);border-radius:8px;padding:11px;
-    font-family:inherit;font-size:13px}
+  html,body{height:100%}
+  body{margin:0;background:
+      radial-gradient(1100px 620px at 78% -12%, rgba(67,200,245,.09), transparent 62%),
+      radial-gradient(900px 560px at 8% 4%, rgba(139,124,246,.08), transparent 60%),
+      var(--bg);
+    color:var(--txt);font-family:var(--ui);font-size:14.5px;line-height:1.55;
+    -webkit-font-smoothing:antialiased}
+  ::selection{background:rgba(67,200,245,.28)}
+
+  /* ---------- scrollbars ---------- */
+  ::-webkit-scrollbar{width:11px;height:11px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#1d2836;border-radius:8px;border:3px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:#2b3a4d;border:3px solid transparent;background-clip:content-box}
+
+  /* ---------- header ---------- */
+  header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;
+    padding:12px 22px;border-bottom:1px solid var(--line);
+    background:rgba(8,12,17,.82);backdrop-filter:blur(14px) saturate(160%)}
+  .brand{display:flex;align-items:center;gap:11px;font-weight:650;letter-spacing:.4px;font-size:14.5px}
+  .logo{width:30px;height:30px;border-radius:9px;flex:0 0 auto;
+    background:linear-gradient(145deg,var(--cyan),var(--violet));
+    display:grid;place-items:center;color:#04080d;font-weight:800;font-size:14px;
+    box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55);
+    font-family:var(--mono)}
+  .brand em{font-style:normal;color:var(--cyan)}
+  .ver{font-size:10.5px;color:var(--dim);font-weight:500;letter-spacing:1px;
+    border:1px solid var(--line);padding:2px 7px;border-radius:20px;font-family:var(--mono)}
+  .grow{margin-left:auto}
+  .hdr-tools{display:flex;align-items:center;gap:8px}
+
+  /* ---------- generic bits ---------- */
+  main{max-width:1180px;margin:0 auto;padding:22px 22px 90px}
+  .panel{background:linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:var(--r2);padding:18px;margin-bottom:18px;
+    box-shadow:var(--sh)}
+  .panel.tight{padding:14px 16px}
+  label,.lbl{display:block;color:var(--muted);font-size:11.5px;margin-bottom:7px;
+    letter-spacing:.9px;text-transform:uppercase;font-weight:600}
+  .sub{color:var(--dim);font-size:12.5px;font-weight:400;text-transform:none;letter-spacing:0}
+  textarea,input[type=text],input[type=password],input[type=number],select{
+    width:100%;background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:var(--r);padding:11px 13px;font-family:var(--ui);font-size:13.5px;
+    outline:none;transition:border-color .15s, box-shadow .15s}
+  textarea:focus,input:focus,select:focus{border-color:var(--cyan);
+    box-shadow:0 0 0 3px rgba(67,200,245,.13)}
   textarea{resize:vertical}
-  #desc{height:96px}
-  .codebox{height:420px;white-space:pre;overflow:auto;tab-size:4;line-height:1.5}
+  #desc{height:104px;font-size:14px;line-height:1.6}
+  select{appearance:none;cursor:pointer;
+    background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+    background-position:calc(100% - 17px) 50%,calc(100% - 12px) 50%;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat;padding-right:34px}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .grid4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px}
-  button{cursor:pointer;border:1px solid var(--line);background:var(--panel2);
-    color:var(--txt);padding:10px 16px;border-radius:8px;font-family:inherit;
-    font-size:13px;letter-spacing:1px;transition:.12s}
-  button:hover{border-color:var(--green);box-shadow:0 0 0 1px var(--green) inset}
-  button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none;border-color:var(--line)}
-  button.primary{background:#10220f;border-color:#1f4a1c;color:var(--green)}
-  button.primary:hover{box-shadow:0 0 14px rgba(73,211,103,.35)}
-  button.build{background:#0c1f24;border-color:#1d4a55;color:var(--cyan)}
-  button.build:hover{box-shadow:0 0 14px rgba(54,199,226,.35)}
-  button.warn{background:#241c0c;border-color:#5a4a1f;color:var(--amber)}
-  button.warn:hover{box-shadow:0 0 14px rgba(232,179,65,.3)}
-  .tabs{display:flex;gap:8px;margin-bottom:14px}
-  .tab{padding:9px 18px;border-radius:8px 8px 0 0;border:1px solid var(--line);
-    background:var(--panel2);color:var(--muted);letter-spacing:1px}
-  .tab.active{color:var(--green);border-color:#1f4a1c;background:#10220f}
-  .chip{padding:7px 12px;font-size:12px;border-radius:20px}
-  .chip:hover{border-color:var(--cyan)}
-  .meta{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 12px}
-  .tag{font-size:11px;padding:4px 9px;border:1px solid var(--line);border-radius:6px;
-    color:var(--muted);background:var(--panel2)}
-  .tag b{color:var(--txt);font-weight:600}
-  .ok{color:var(--green);border-color:#1f4a1c}
-  .bad{color:var(--danger);border-color:#5a1f1f}
-  .warnc{color:var(--amber);border-color:#5a4a1f}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  @media(max-width:760px){.grid4{grid-template-columns:1fr 1fr}}
+  .hint{color:var(--dim);font-size:12.5px;margin:0}
   .hidden{display:none !important}
-  .gear{font-size:12px;padding:8px 12px}
-  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;
-    align-items:center;justify-content:center;z-index:50}
-  .modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
-    width:min(560px,92vw);max-height:88vh;overflow:auto;padding:18px}
-  .modal h2{margin:0 0 14px;font-size:14px;letter-spacing:2px;color:var(--cyan)}
-  .modal input[type=text],.modal input[type=password]{margin-bottom:4px}
-  .modal .field{margin-bottom:14px}
-  .modal .adv{margin:2px 0 8px;border-top:1px solid var(--line);padding-top:10px}
-  .modal .adv summary{cursor:pointer;color:var(--muted);font-size:12px;letter-spacing:1px}
-  .modal .clr{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:11px;margin-top:4px}
-  .hint{color:var(--muted);font-size:12px;margin-top:8px}
-  .sectlabel{color:var(--muted);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin:2px 0 8px}
-  #validation{background:#060806;border:1px solid var(--line);border-radius:8px;padding:10px;
-    margin-top:12px;max-height:220px;overflow:auto;font-size:12.5px}
-  .issue{display:flex;gap:8px;padding:5px 0;border-bottom:1px dashed #15201510}
-  .issue .sev{flex:0 0 auto;font-weight:700;letter-spacing:1px}
-  .issue .body{flex:1}
-  .issue .fix{color:var(--muted);font-size:11.5px;margin-top:2px}
-  .sev.error{color:var(--danger)} .sev.warn{color:var(--amber)} .sev.info{color:var(--cyan)}
-  .sev.ok{color:var(--green)}
-  #log,#testout{height:300px;white-space:pre-wrap;overflow:auto;background:#060806;
-    border:1px solid var(--line);border-radius:8px;padding:11px;font-size:12px;color:#bfe0bf}
-  #testout{height:170px}
-  details.adv2{margin-top:12px;border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--panel2)}
-  details.adv2 summary{cursor:pointer;color:var(--muted);letter-spacing:1px;font-size:12px}
-  .pillset{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}
-  .pillset label{display:flex;align-items:center;gap:6px;color:var(--txt);margin:0}
-  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);
-    border-top-color:var(--cyan);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+
+  /* ---------- buttons ---------- */
+  button{cursor:pointer;border:1px solid var(--line2);background:var(--panel3);
+    color:var(--txt);padding:10px 17px;border-radius:10px;font-family:var(--ui);
+    font-size:13px;font-weight:600;letter-spacing:.3px;transition:.14s;
+    display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+  button:hover:not(:disabled){border-color:#3d5570;background:#1c2736;transform:translateY(-1px)}
+  button:active:not(:disabled){transform:translateY(0)}
+  button:disabled{opacity:.38;cursor:not-allowed}
+  button.primary{background:linear-gradient(180deg,#3ddc84,#2bb96b);border-color:#2bb96b;color:#04140b}
+  button.primary:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(61,220,132,.75);background:linear-gradient(180deg,#4ce792,#31c574)}
+  button.accent{background:linear-gradient(180deg,#43c8f5,#2ba7d4);border-color:#2ba7d4;color:#03151d}
+  button.accent:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(67,200,245,.75)}
+  button.violet{background:linear-gradient(180deg,#8b7cf6,#6f5fe0);border-color:#6f5fe0;color:#0b0720}
+  button.violet:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(139,124,246,.7)}
+  button.warn{background:#2a2010;border-color:#5d4820;color:var(--amber)}
+  button.ghost{background:transparent}
+  button.sm{padding:7px 12px;font-size:12px;border-radius:9px}
+  .chip{padding:7px 13px;font-size:12.5px;border-radius:20px;font-weight:500;
+    background:var(--panel2);border-color:var(--line)}
+  .chip:hover:not(:disabled){border-color:var(--cyan);color:var(--cyan)}
+
+  /* ---------- tabs ---------- */
+  .tabs{display:inline-flex;gap:4px;padding:4px;background:var(--panel);
+    border:1px solid var(--line);border-radius:13px;margin-bottom:18px}
+  .tab{padding:8px 20px;border-radius:9px;color:var(--muted);cursor:pointer;
+    font-weight:600;font-size:13px;transition:.15s;user-select:none;letter-spacing:.3px}
+  .tab:hover{color:var(--txt)}
+  .tab.active{color:#04080d;background:linear-gradient(180deg,var(--cyan),#2ba7d4);
+    box-shadow:0 4px 14px -6px rgba(67,200,245,.8)}
+
+  /* ---------- status pills ---------- */
+  .pills{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:5px 11px;
+    border:1px solid var(--line);border-radius:20px;color:var(--muted);
+    background:var(--panel2);font-family:var(--mono);white-space:nowrap}
+  .pill b{color:var(--txt);font-weight:650}
+  .pill.ok{color:var(--green);border-color:rgba(61,220,132,.35);background:rgba(61,220,132,.09)}
+  .pill.bad{color:var(--danger);border-color:rgba(255,95,109,.35);background:rgba(255,95,109,.09)}
+  .pill.warn{color:var(--amber);border-color:rgba(255,179,64,.32);background:rgba(255,179,64,.09)}
+  .pill.info{color:var(--cyan);border-color:rgba(67,200,245,.3);background:rgba(67,200,245,.08)}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto}
+  .pill.ok .dot{box-shadow:0 0 8px currentColor}
+  .docwrap{position:relative}
+  #docsum{cursor:pointer}
+  #docsum:hover{border-color:var(--line2)}
+  #doctor{position:absolute;right:0;top:34px;display:none;flex-direction:column;gap:6px;
+    padding:12px;background:var(--panel3);border:1px solid var(--line2);border-radius:13px;
+    box-shadow:0 20px 50px -16px rgba(0,0,0,.92);min-width:270px;z-index:40}
+  #doctor.open{display:flex}
+  #doctor .pill{justify-content:flex-start}
+
+  /* ---------- editor ---------- */
+  .editor{position:relative;border:1px solid var(--line);border-radius:var(--r);
+    background:#070b10;overflow:hidden;display:flex;height:480px;min-height:180px;
+    resize:vertical;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
+  .editor:focus-within{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(67,200,245,.11)}
+  .gutter{flex:0 0 auto;height:100%;padding:13px 10px 13px 14px;text-align:right;color:#39485c;
+    font-family:var(--mono);font-size:12.5px;line-height:1.65;user-select:none;
+    background:#080d13;border-right:1px solid var(--line);overflow:hidden;min-width:54px}
+  .gutter span{display:block}
+  .gutter span.kit{color:#26313f}
+  #code{flex:1;height:100%;border:0;border-radius:0;background:transparent;
+    font-family:var(--mono);font-size:12.5px;line-height:1.65;padding:13px 14px;
+    white-space:pre;overflow:auto;tab-size:4;resize:none;box-shadow:none !important}
+  #code:focus{box-shadow:none}
+  .edbar{display:flex;align-items:center;gap:10px;margin:12px 0 8px;flex-wrap:wrap}
+
+  /* ---------- issues ---------- */
+  .issues{background:#070b10;border:1px solid var(--line);border-radius:var(--r);
+    margin-top:14px;max-height:280px;overflow:auto}
+  .issue{display:flex;gap:11px;padding:10px 13px;border-bottom:1px solid #101822;
+    font-size:13px;align-items:flex-start}
+  .issue:last-child{border-bottom:0}
+  .issue:hover{background:#0a1017}
+  .sev{flex:0 0 auto;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.6px;
+    padding:3px 7px;border-radius:5px;margin-top:1px;min-width:52px;text-align:center}
+  .sev.error{color:#ffd0d4;background:rgba(255,95,109,.18);border:1px solid rgba(255,95,109,.34)}
+  .sev.warn{color:#ffe2b8;background:rgba(255,179,64,.15);border:1px solid rgba(255,179,64,.32)}
+  .sev.info{color:#c4e9fb;background:rgba(67,200,245,.14);border:1px solid rgba(67,200,245,.3)}
+  .sev.ok{color:#c2f5da;background:rgba(61,220,132,.14);border:1px solid rgba(61,220,132,.32)}
+  .issue .fix{color:var(--dim);font-size:12px;margin-top:3px}
+  .issue .fix b{color:var(--cyan);font-weight:600}
+
+  /* ---------- agent rail ---------- */
+  .rail{max-height:300px;overflow:auto;background:#070b10;border:1px solid var(--line);
+    border-radius:var(--r);padding:6px 0;margin-top:12px}
+  .stepr{display:flex;gap:11px;padding:7px 14px;font-size:12.8px;align-items:flex-start;
+    font-family:var(--mono)}
+  .stepr .ic{flex:0 0 auto;width:16px;text-align:center;font-size:12px;margin-top:1px}
+  .stepr.ok .ic{color:var(--green)} .stepr.fail .ic{color:var(--danger)}
+  .stepr.warn .ic{color:var(--amber)} .stepr.step .ic{color:var(--cyan)}
+  .stepr.info .ic{color:var(--dim)}
+  .stepr .tx{flex:1;color:var(--muted);word-break:break-word}
+  .stepr.ok .tx,.stepr.step .tx{color:var(--txt)}
+
+  /* ---------- phases ---------- */
+  .phases{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+  .ph{display:flex;align-items:center;gap:6px;font-size:11.5px;padding:5px 10px;
+    border-radius:8px;font-family:var(--mono);border:1px solid var(--line);background:var(--panel2)}
+  .ph.ok{color:var(--green);border-color:rgba(61,220,132,.3);background:rgba(61,220,132,.08)}
+  .ph.bad{color:var(--danger);border-color:rgba(255,95,109,.35);background:rgba(255,95,109,.1)}
+
+  /* ---------- logs ---------- */
+  .log{height:320px;white-space:pre-wrap;overflow:auto;background:#070b10;
+    border:1px solid var(--line);border-radius:var(--r);padding:13px;font-size:12px;
+    color:#9fb6cc;font-family:var(--mono);line-height:1.6}
+  #testout{height:210px}
+
+  /* ---------- section headings ---------- */
+  .sect{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+  .sect h3{margin:0;font-size:12px;letter-spacing:1.2px;text-transform:uppercase;
+    color:var(--muted);font-weight:700}
+  .sect .line{flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent)}
+
+  /* ---------- modal ---------- */
+  .overlay{position:fixed;inset:0;background:rgba(3,6,10,.72);backdrop-filter:blur(6px);
+    display:flex;align-items:center;justify-content:center;z-index:60;padding:20px}
+  .modal{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line2);
+    border-radius:18px;width:min(620px,96vw);max-height:88vh;overflow:auto;padding:24px;
+    box-shadow:0 30px 90px -20px rgba(0,0,0,.9)}
+  .modal h2{margin:0 0 4px;font-size:16px;letter-spacing:.3px;font-weight:700}
+  .modal .msub{color:var(--dim);font-size:12.5px;margin:0 0 20px}
+  .field{margin-bottom:16px}
+  .modal details{margin:6px 0 16px;border-top:1px solid var(--line);padding-top:14px}
+  .modal summary{cursor:pointer;color:var(--muted);font-size:12.5px;font-weight:600;
+    letter-spacing:.4px;user-select:none}
+  .modal summary:hover{color:var(--cyan)}
+  .check{display:flex;align-items:center;gap:9px;color:var(--txt);font-size:13px;
+    margin:0;text-transform:none;letter-spacing:0;font-weight:500}
+  .check input{width:auto;margin:0;accent-color:var(--cyan)}
+  .checks{display:flex;flex-direction:column;gap:11px}
+
+  /* ---------- toasts ---------- */
+  #toasts{position:fixed;right:20px;bottom:20px;z-index:80;display:flex;
+    flex-direction:column;gap:9px;align-items:flex-end}
+  .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--cyan);
+    border-radius:11px;padding:11px 16px;font-size:13px;max-width:400px;
+    box-shadow:0 14px 40px -14px rgba(0,0,0,.9);animation:tin .22s ease-out}
+  .toast.ok{border-left-color:var(--green)}
+  .toast.bad{border-left-color:var(--danger)}
+  .toast.warn{border-left-color:var(--amber)}
+  @keyframes tin{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
+
+  /* ---------- spinner + progress ---------- */
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.2);
+    border-top-color:currentColor;border-radius:50%;animation:sp .7s linear infinite}
   @keyframes sp{to{transform:rotate(360deg)}}
-  a.link{color:var(--cyan);text-decoration:none}
+  .bar{height:2px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:14px}
+  .bar i{display:block;height:100%;width:30%;border-radius:2px;
+    background:linear-gradient(90deg,var(--cyan),var(--violet));animation:sl 1.1s ease-in-out infinite}
+  @keyframes sl{0%{margin-left:-30%}100%{margin-left:100%}}
+
+  /* ---------- sticky action bar ---------- */
+  .actions{position:sticky;bottom:0;z-index:20;margin:16px -18px -18px;padding:14px 18px;
+    background:rgba(10,15,21,.93);backdrop-filter:blur(12px);
+    border-top:1px solid var(--line);border-radius:0 0 var(--r2) var(--r2);
+    display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .empty{text-align:center;padding:44px 20px;color:var(--dim)}
+  .empty .big{font-size:38px;opacity:.35;margin-bottom:10px}
 </style>
 </head>
 <body>
 <header>
-  <span class="dot"></span>
-  <h1>THE DAWG // <span>APK FORGE</span> <span class="ver">v2.0</span></h1>
-  <span class="spacer" style="margin-left:auto"></span>
-  <div id="doctor"></div>
-  <button class="gear" onclick="openSettings()">&#9881; settings</button>
-  <button class="gear" onclick="quitApp()">quit</button>
+  <div class="brand">
+    <div class="logo">D</div>
+    <span>THE DAWG <em>// APK FORGE</em></span>
+    <span class="ver">v3.0</span>
+  </div>
+  <span class="grow"></span>
+  <div class="hdr-tools">
+    <div class="docwrap">
+      <span class="pill" id="docsum" onclick="toggleDoctor()"><span class="dot"></span>checking...</span>
+      <div id="doctor"></div>
+    </div>
+    <span class="pill info" id="tokpill" title="tokens used this session"><span class="dot"></span><b>0</b> tok</span>
+    <button class="sm ghost" onclick="openSettings()">&#9881;&#xFE0E; Settings</button>
+    <button class="sm ghost" onclick="quitApp()">Quit</button>
+  </div>
 </header>
+
 <main>
   <div class="tabs">
     <div class="tab active" id="tab_ai" onclick="setMode('ai')">AI FORGE</div>
     <div class="tab" id="tab_manual" onclick="setMode('manual')">MANUAL</div>
   </div>
 
-  <div class="card" id="ai_panel">
-    <label>describe the android app you want</label>
-    <textarea id="desc" placeholder="e.g. a dark-themed pomodoro timer with start/pause, a circular countdown, and a session counter that saves between launches"></textarea>
-    <div class="row" style="margin-top:10px">
-      <button class="primary" id="forgeBtn" onclick="forge()">FORGE APP</button>
-      <span class="hint" style="margin:0">Ctrl/Cmd+Enter to forge. The kit + a launcher icon are added automatically.</span>
+  <!-- ============ AI panel ============ -->
+  <div class="panel" id="ai_panel">
+    <label>Describe the Android app you want
+      <span class="sub">&mdash; the UI kit, launcher icon and splash are added for you</span></label>
+    <textarea id="desc" placeholder="a dark pomodoro timer with start/pause, a circular countdown ring, and a session counter that survives a restart"></textarea>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="forgeBtn" onclick="forge()">Forge app</button>
+      <button class="violet" id="autoBtn" onclick="autoForge()" title="forge, then check, self-test and fix until it passes">Forge &amp; verify</button>
+      <span class="hint">Ctrl+Enter to forge. <b style="color:var(--violet)">Forge &amp; verify</b> runs the whole loop: build &rarr; repair &rarr; self-test &rarr; fix.</span>
     </div>
-    <div class="row" style="margin-top:10px">
-      <button class="chip" onclick="refine('Make it look more polished and modern, tighten the layout and spacing')">&#10022; polish look</button>
-      <button class="chip" onclick="refine('Add sound effects generated at runtime (no external files)')">&#10022; add sound</button>
-      <button class="chip" onclick="refine('Add a settings screen and persist preferences in user_data_dir')">&#10022; add settings</button>
-      <button class="chip" onclick="refine('Add a high score / stats screen saved between launches')">&#10022; add scores</button>
+    <div class="row" style="margin-top:12px">
+      <button class="chip" onclick="refine('Make it look more polished and modern: tighten the layout, spacing and hierarchy')">&#9733; polish look</button>
+      <button class="chip" onclick="refine('Add sound effects generated at runtime, no external files')">&#9834; add sound</button>
+      <button class="chip" onclick="refine('Add a settings screen and persist preferences in user_data_dir')">&#9881;&#xFE0E; add settings</button>
+      <button class="chip" onclick="refine('Add a high score / stats screen saved between launches')">&#9733; add scores</button>
+      <button class="chip" onclick="refine('Add a dark/light theme toggle that persists')">&#9681; theme toggle</button>
     </div>
   </div>
 
-  <div class="card hidden" id="manual_panel">
-    <label>start from a template (the Dawg UI kit is included at the top so you can use Card / PillButton / TextField / etc.)</label>
+  <!-- ============ Manual panel ============ -->
+  <div class="panel hidden" id="manual_panel">
+    <div class="sect"><h3>Manual mode</h3><span class="line"></span></div>
+    <p class="hint" style="margin-bottom:14px">
+      The editor is empty and the file is exactly what you type &mdash; no kit, no scaffold.
+      Add the Dawg UI kit or drop in a starter only if you want one.</p>
     <div class="row">
-      <select id="tpl_sel" style="max-width:320px"></select>
-      <button onclick="loadTemplate()">LOAD TEMPLATE</button>
-      <button onclick="loadTemplate('blank')">BLANK</button>
-      <span class="hint" style="margin:0">then edit main.py below and use TEST RUN / BUILD.</span>
+      <select id="tpl_sel" style="max-width:340px"></select>
+      <button onclick="loadTemplate()">Insert starter</button>
+      <button class="ghost" onclick="toggleKit()" id="kitBtn">+ Add UI kit</button>
+      <button class="ghost" onclick="newBlank()">Clear</button>
     </div>
   </div>
 
-  <div class="card hidden" id="out">
-    <div class="meta" id="meta"></div>
+  <!-- ============ Workspace ============ -->
+  <div class="panel hidden" id="out">
+    <div class="pills" id="meta" style="margin-bottom:16px"></div>
 
-    <div class="grid4" style="margin-bottom:10px">
-      <div><label>app name (package)</label><input type="text" id="f_name"></div>
-      <div><label>title</label><input type="text" id="f_title"></div>
-      <div><label>orientation</label>
+    <div class="grid4" style="margin-bottom:12px">
+      <div><label>App name <span class="sub">(package)</span></label><input type="text" id="f_name" placeholder="my_app"></div>
+      <div><label>Title</label><input type="text" id="f_title" placeholder="My App"></div>
+      <div><label>Orientation</label>
         <select id="f_orient">
           <option value="portrait">portrait</option>
           <option value="landscape">landscape</option>
           <option value="all">all</option>
         </select>
       </div>
-      <div><label>permissions</label><input type="text" id="f_perms" placeholder="INTERNET,VIBRATE"></div>
+      <div><label>Permissions</label><input type="text" id="f_perms" placeholder="INTERNET,VIBRATE"></div>
     </div>
-    <div style="margin-bottom:10px"><label>requirements</label><input type="text" id="f_reqs" placeholder="python3,kivy"></div>
+    <div style="margin-bottom:14px"><label>Requirements</label>
+      <input type="text" id="f_reqs" placeholder="python3,kivy"></div>
 
-    <label>main.py (full file -- kit at top, your app below)</label>
-    <textarea id="code" class="codebox" spellcheck="false"></textarea>
-
-    <div id="validation"></div>
-
-    <div class="row" style="margin-top:12px">
-      <button class="build" id="buildBtn" onclick="buildApk()">BUILD APK</button>
-      <button id="testBtn" onclick="testRun()">TEST RUN</button>
-      <button class="warn" id="fixBtn" onclick="autoFix()">AUTO-FIX</button>
-      <button id="polishBtn" onclick="polish()">POLISH</button>
-      <button id="zipBtn" onclick="downloadProject()">DOWNLOAD PROJECT</button>
+    <div class="edbar">
+      <span class="lbl" style="margin:0">main.py</span>
+      <span class="pill" id="kitpill"></span>
+      <span class="grow"></span>
+      <span class="pill" id="livelint"></span>
+    </div>
+    <div class="editor">
+      <div class="gutter" id="gutter"></div>
+      <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
     </div>
 
-    <details class="adv2">
-      <summary>advanced build config</summary>
-      <div class="pillset">
-        <label><input type="checkbox" id="arch_a64" checked> arm64-v8a <span class="hint" style="margin:0">(ROG 5S + all modern)</span></label>
-        <label><input type="checkbox" id="arch_a32"> armeabi-v7a <span class="hint" style="margin:0">(old 32-bit)</span></label>
+    <div class="issues" id="validation"></div>
+
+    <details style="margin-top:14px">
+      <summary style="cursor:pointer;color:var(--muted);font-size:12.5px;font-weight:600">Advanced build config</summary>
+      <div class="checks" style="margin-top:14px">
+        <label class="check"><input type="checkbox" id="arch_a64" checked> arm64-v8a <span class="hint">&mdash; every modern phone; halves build time</span></label>
+        <label class="check"><input type="checkbox" id="arch_a32"> armeabi-v7a <span class="hint">&mdash; old 32-bit hardware</span></label>
       </div>
-      <div class="grid" style="margin-top:10px;max-width:420px">
+      <div class="grid2" style="margin-top:14px;max-width:440px">
         <div><label>android.api</label><input type="text" id="b_api" value="34"></div>
         <div><label>android.minapi</label><input type="text" id="b_minapi" value="24"></div>
       </div>
-      <div class="hint">arm64-v8a alone covers your ROG Phone 5S and every current device, and halves build time.</div>
     </details>
 
-    <div id="testpanel" class="hidden" style="margin-top:14px">
-      <div class="sectlabel">test run</div>
-      <div id="testout"></div>
+    <div id="testpanel" class="hidden" style="margin-top:18px">
+      <div class="sect"><h3>Self-test</h3><span class="line"></span></div>
+      <div class="phases" id="phases"></div>
+      <div class="log" id="testout" style="margin-top:12px"></div>
+    </div>
+
+    <div class="actions">
+      <button class="accent" id="buildBtn" onclick="buildApk()">Build APK</button>
+      <button id="testBtn" onclick="testRun()">Self-test</button>
+      <button class="warn" id="fixBtn" onclick="autoFix()">Auto-fix</button>
+      <button id="repairBtn" onclick="localRepair()" title="deterministic fixes, no API call">Repair free</button>
+      <button id="polishBtn" onclick="polish()">Polish</button>
+      <button class="ghost" id="zipBtn" onclick="downloadProject()">Download project</button>
     </div>
   </div>
 
-  <div class="card hidden" id="logwrap">
-    <div class="row" style="margin-bottom:10px">
-      <div class="sectlabel" style="margin:0">build log</div>
-      <span class="spacer" style="margin-left:auto"></span>
-      <button id="apkBtn" class="build hidden" onclick="downloadApk()">DOWNLOAD APK</button>
+  <!-- ============ Idle hint ============ -->
+  <div class="panel" id="idle">
+    <div class="empty">
+      <div class="big">&#9874;</div>
+      <div style="color:var(--muted);font-size:14.5px;margin-bottom:6px">Nothing forged yet</div>
+      <div style="max-width:520px;margin:0 auto">Describe an app above, or switch to
+        <b style="color:var(--cyan);cursor:pointer" onclick="setMode('manual')">MANUAL</b>
+        to write it yourself in an empty file.</div>
+      <div class="pills" style="justify-content:center;margin-top:18px">
+        <span class="pill info">every app is static-checked before it can build</span>
+        <span class="pill info">self-test taps every button before you burn 40 min</span>
+        <span class="pill info">local repairs cost 0 tokens</span>
+      </div>
     </div>
-    <div id="log"></div>
+  </div>
+
+  <!-- ============ Agent panel ============ -->
+  <div class="panel hidden" id="agentwrap">
+    <div class="sect"><h3>Forge &amp; verify</h3><span class="line"></span>
+      <span class="pill" id="agentstat"></span></div>
+    <div class="rail" id="rail"></div>
+    <div class="bar hidden" id="agentbar"><i></i></div>
+  </div>
+
+  <!-- ============ Build log ============ -->
+  <div class="panel hidden" id="logwrap">
+    <div class="sect"><h3>Build log</h3><span class="line"></span>
+      <button id="apkBtn" class="accent sm hidden" onclick="downloadApk()">&#8595; Download APK</button></div>
+    <div class="log" id="log"></div>
   </div>
 </main>
 
+<!-- ============ Settings ============ -->
 <div class="overlay hidden" id="settings" onclick="overlayClick(event)">
   <div class="modal">
-    <h2>SETTINGS</h2>
+    <h2>Settings</h2>
+    <p class="msub">Keys live in ~/.androdawg/config.json (chmod 600). SiliconFlow is primary, Groq is the fallback.</p>
+
     <div class="field">
-      <label>SiliconFlow API key <span id="sfset" class="hint"></span></label>
-      <input type="password" id="sf_key" placeholder="sk-... (leave blank to keep current)">
-      <div class="clr"><input type="checkbox" id="clear_sf"> clear stored key</div>
+      <label>SiliconFlow API key <span class="sub" id="sfset"></span></label>
+      <input type="password" id="sf_key" placeholder="sk-...  (blank keeps the current key)">
+      <label class="check" style="margin-top:8px"><input type="checkbox" id="clear_sf"> clear stored key</label>
     </div>
     <div class="field">
-      <label>SiliconFlow model</label>
+      <label>Model</label>
       <select id="sf_model_sel" onchange="onModelChange()">
-        <option value="deepseek-ai/DeepSeek-V4-Flash">deepseek-ai/DeepSeek-V4-Flash</option>
+        <option value="deepseek-ai/DeepSeek-V4-Pro">deepseek-ai/DeepSeek-V4-Pro</option>
+        <option value="deepseek-ai/DeepSeek-V4-Flash">deepseek-ai/DeepSeek-V4-Flash (cheaper)</option>
         <option value="deepseek-ai/DeepSeek-V3">deepseek-ai/DeepSeek-V3</option>
         <option value="Qwen/Qwen2.5-Coder-32B-Instruct">Qwen/Qwen2.5-Coder-32B-Instruct</option>
         <option value="__custom__">custom...</option>
       </select>
-      <input type="text" id="sf_model_custom" class="hidden" placeholder="provider/model" style="margin-top:6px">
+      <input type="text" id="sf_model_custom" class="hidden" placeholder="provider/model" style="margin-top:8px">
     </div>
-    <details class="adv">
-      <summary>advanced (endpoints + Groq fallback)</summary>
-      <div class="field" style="margin-top:12px">
+
+    <details open>
+      <summary>Token spend</summary>
+      <div class="grid2" style="margin-top:14px">
+        <div><label>Max tokens per call</label><input type="number" id="max_tokens" min="1000" max="32000" step="500"></div>
+        <div><label>Session budget <span class="sub">(0 = off)</span></label><input type="number" id="token_budget" min="0" step="1000"></div>
+      </div>
+      <div style="margin-top:14px"><label>Auto-fix rounds <span class="sub">(forge &amp; verify)</span></label>
+        <input type="number" id="agent_rounds" min="1" max="6"></div>
+      <div class="checks" style="margin-top:16px">
+        <label class="check"><input type="checkbox" id="cache"> Reuse identical responses <span class="hint">&mdash; repeats cost nothing</span></label>
+        <label class="check"><input type="checkbox" id="auto_repair"> Repair locally first <span class="hint">&mdash; fix what code can fix before paying the model</span></label>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button class="sm ghost" onclick="clearCache()">Clear response cache</button>
+        <span class="hint" id="usagenote"></span>
+      </div>
+    </details>
+
+    <details>
+      <summary>Endpoints &amp; Groq fallback</summary>
+      <div class="field" style="margin-top:14px">
         <label>SiliconFlow endpoint</label>
         <input type="text" id="sf_url" placeholder="https://api.siliconflow.cn/v1">
       </div>
       <div class="field">
-        <label>Groq API key (fallback) <span id="gqset" class="hint"></span></label>
-        <input type="password" id="groq_key" placeholder="gsk-... (leave blank to keep current)">
-        <div class="clr"><input type="checkbox" id="clear_groq"> clear stored key</div>
+        <label>Groq API key <span class="sub" id="gqset"></span></label>
+        <input type="password" id="groq_key" placeholder="gsk-...">
+        <label class="check" style="margin-top:8px"><input type="checkbox" id="clear_groq"> clear stored key</label>
       </div>
-      <div class="field">
-        <label>Groq model</label>
-        <input type="text" id="groq_model" placeholder="llama-3.3-70b-versatile">
-      </div>
-      <div class="field">
-        <label>Groq endpoint</label>
-        <input type="text" id="groq_url" placeholder="https://api.groq.com/openai/v1">
-      </div>
+      <div class="field"><label>Groq model</label><input type="text" id="groq_model" placeholder="llama-3.3-70b-versatile"></div>
+      <div class="field"><label>Groq endpoint</label><input type="text" id="groq_url" placeholder="https://api.groq.com/openai/v1"></div>
     </details>
-    <div class="row">
-      <button class="primary" onclick="saveSettings()">SAVE</button>
-      <button onclick="closeSettings()">CLOSE</button>
-      <span id="setmsg" class="hint" style="margin:0"></span>
+
+    <div class="row" style="margin-top:4px">
+      <button class="primary" onclick="saveSettings()">Save</button>
+      <button class="ghost" onclick="closeSettings()">Close</button>
+      <span class="hint" id="setmsg"></span>
     </div>
-    <div class="hint" style="margin-top:10px">Keys are stored in ~/.androdawg/config.json (chmod 600). SiliconFlow/DeepSeek is primary; Groq is the fallback.</div>
   </div>
 </div>
 
+<div id="toasts"></div>
 <script>
-var cur = null;
-var history = [];
+var cur = null;          // current payload
+var turns = [];          // short user turns only -- never full responses (token discipline)
 var mode = 'ai';
-var pollT = null, testT = null;
+var pollT = null, testT = null, jobT = null;
+var lintT = null;
+var useKit = false;      // manual mode starts with no kit at all
 
-function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
 function $(id){return document.getElementById(id);}
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function show(id){$(id).classList.remove('hidden');}
 function hide(id){$(id).classList.add('hidden');}
 
+/* ---------------------------------------------------------------- toasts */
+function toast(msg, kind){
+  var d=document.createElement('div');
+  d.className='toast '+(kind||'');
+  d.textContent=msg;
+  $('toasts').appendChild(d);
+  setTimeout(function(){ d.style.transition='opacity .3s, transform .3s';
+    d.style.opacity='0'; d.style.transform='translateX(20px)';
+    setTimeout(function(){d.remove();},320); }, kind==='bad'?6500:3600);
+}
+
+/* ---------------------------------------------------------------- busy state */
+function busy(btn, label){
+  var b=$(btn); if(!b) return function(){};
+  var old=b.innerHTML; b.disabled=true;
+  b.innerHTML='<span class="spin"></span> '+label;
+  return function(){ b.disabled=false; b.innerHTML=old; refreshButtons(); };
+}
+
+/* ---------------------------------------------------------------- mode */
 function setMode(m){
   mode=m;
   $('tab_ai').classList.toggle('active', m==='ai');
   $('tab_manual').classList.toggle('active', m==='manual');
   $('ai_panel').classList.toggle('hidden', m!=='ai');
   $('manual_panel').classList.toggle('hidden', m!=='manual');
+  if(m==='manual' && !cur){ newBlank(); }
 }
 
-function refine(text){
-  if(!cur){ $('desc').value = (($('desc').value||'')+' '+text).trim(); $('desc').focus(); return; }
-  $('desc').value = text;
-  forge();
+/* Manual mode opens a genuinely empty file: no kit, no scaffold, nothing to delete. */
+function newBlank(){
+  useKit=false;
+  cur={ok:true, name:'', title:'', orientation:'portrait', permissions:'',
+       requirements:'python3,kivy', main_py:'', app_py:'', kit:false,
+       issues:[], errors:[], warnings:[], syntax_ok:true, syntax_msg:'',
+       provider:'local (no AI, 0 tokens)'};
+  render(cur, true);
+  $('code').focus();
 }
 
+async function toggleKit(){
+  if(!cur){ newBlank(); }
+  collect();
+  useKit = !useKit;
+  try{
+    var r=await fetch('/api/manual',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:cur.name||'app', title:cur.title, main_py:cur.app_py||cur.main_py,
+        requirements:cur.requirements, permissions:cur.permissions,
+        orientation:cur.orientation, kit:useKit})});
+    var d=await r.json();
+    render(d);
+    toast(useKit?'UI kit added above your code':'UI kit removed', 'ok');
+  }catch(e){ toast('network: '+e,'bad'); }
+}
+
+/* ---------------------------------------------------------------- gutter */
+function syncGutter(){
+  var ta=$('code'), g=$('gutter');
+  var lines=(ta.value||'').split('\n').length;
+  var kitLines=(cur&&cur.kit_lines)?cur.kit_lines:0;
+  var html='';
+  for(var i=1;i<=lines;i++){
+    html += '<span'+(i<=kitLines?' class="kit"':'')+'>'+i+'</span>';
+  }
+  g.innerHTML=html;
+  g.scrollTop=ta.scrollTop;
+}
+
+/* ---------------------------------------------------------------- rendering */
 function metaTags(p){
   var t=[];
-  if(p.provider) t.push('<span class="tag">via <b>'+esc(p.provider)+'</b></span>');
-  t.push('<span class="tag '+(p.syntax_ok?'ok':'bad')+'">syntax: <b>'+(p.syntax_ok?'ok':'error')+'</b></span>');
+  if(p.provider) t.push('<span class="pill">via <b>'+esc(p.provider)+'</b></span>');
+  t.push('<span class="pill '+(p.syntax_ok?'ok':'bad')+'"><span class="dot"></span>syntax <b>'+
+         (p.syntax_ok?'ok':'error')+'</b></span>');
   var ne=(p.errors||[]).length, nw=(p.warnings||[]).length;
-  t.push('<span class="tag '+(ne?'bad':'ok')+'">errors: <b>'+ne+'</b></span>');
-  t.push('<span class="tag '+(nw?'warnc':'')+'">warnings: <b>'+nw+'</b></span>');
-  if(p.notes) t.push('<span class="tag">'+esc(p.notes)+'</span>');
-  $('meta').innerHTML = t.join('');
+  t.push('<span class="pill '+(ne?'bad':'ok')+'">errors <b>'+ne+'</b></span>');
+  if(nw) t.push('<span class="pill warn">warnings <b>'+nw+'</b></span>');
+  if(p.repairs && p.repairs.length)
+    t.push('<span class="pill info">auto-repaired <b>'+p.repairs.length+'</b></span>');
+  if(p.notes) t.push('<span class="pill">'+esc(p.notes)+'</span>');
+  $('meta').innerHTML=t.join('');
+
+  $('kitpill').innerHTML = p.kit===false
+    ? 'no kit &mdash; plain file'
+    : 'UI kit: lines 1&ndash;'+(p.kit_lines||0)+' <b>locked</b>';
+  $('kitBtn').textContent = (p.kit===false) ? '+ Add UI kit' : '\u2212 Remove UI kit';
+  useKit = (p.kit!==false);
 }
 
 function renderValidation(p){
-  var rows=[];
-  if(p.syntax_ok){ rows.push('<div class="issue"><div class="sev ok">OK</div><div class="body">syntax valid</div></div>'); }
-  else { rows.push('<div class="issue"><div class="sev error">SYNTAX</div><div class="body">'+esc(p.syntax_msg||'syntax error')+'</div></div>'); }
-  var iss = p.issues||[];
+  var rows=[], iss=p.issues||[];
+  if(!p.syntax_ok){
+    rows.push('<div class="issue"><div class="sev error">SYNTAX</div><div><div>'+
+      esc(p.syntax_msg||'syntax error')+'</div></div></div>');
+  }
+  (p.repairs||[]).forEach(function(f){
+    rows.push('<div class="issue"><div class="sev ok">FIXED</div><div><div>'+esc(f)+
+      '</div><div class="fix">done locally &mdash; <b>0 tokens</b></div></div></div>');
+  });
   iss.forEach(function(it){
     var sev=(it.sev||'info');
-    rows.push('<div class="issue"><div class="sev '+sev+'">'+sev.toUpperCase()+'</div><div class="body">'+esc(it.msg)+
+    rows.push('<div class="issue"><div class="sev '+sev+'">'+sev.toUpperCase()+
+      '</div><div><div>'+esc(it.msg)+'</div>'+
       (it.fix?'<div class="fix">&#8627; '+esc(it.fix)+'</div>':'')+'</div></div>');
   });
   (p.build_warnings||[]).forEach(function(w){
-    rows.push('<div class="issue"><div class="sev warn">BUILD</div><div class="body">'+esc(w)+'</div></div>');
+    rows.push('<div class="issue"><div class="sev warn">BUILD</div><div><div>'+esc(w)+'</div></div></div>');
   });
-  if(iss.length===0 && p.syntax_ok){ rows.push('<div class="issue"><div class="sev ok">OK</div><div class="body">no launch issues found by static analysis</div></div>'); }
-  $('validation').innerHTML = rows.join('');
+  if(!rows.length){
+    if(!(p.main_py||'').trim()){
+      rows.push('<div class="empty"><div class="big">&#9634;</div>Empty file. Start typing, insert a starter, or add the UI kit.</div>');
+    } else {
+      rows.push('<div class="issue"><div class="sev ok">CLEAN</div><div><div>Syntax valid and no launch issues found.</div>'+
+        '<div class="fix">Run <b>Self-test</b> to actually launch it, tap every button and soak it before you burn a build.</div></div></div>');
+    }
+  }
+  $('validation').innerHTML=rows.join('');
 }
 
-function render(p){
-  if(!p || !p.ok){
-    alert((p&&p.error)||'forge failed');
-    return;
-  }
+function render(p, quiet){
+  if(!p || !p.ok){ toast((p&&p.error)||'that failed','bad'); return; }
   cur=p;
-  show('out');
+  show('out'); hide('idle');
   $('f_name').value=p.name||'';
   $('f_title').value=p.title||'';
   $('f_orient').value=p.orientation||'portrait';
@@ -2068,10 +3452,10 @@ function render(p){
     if(p.build_overrides.api) $('b_api').value=p.build_overrides.api;
     if(p.build_overrides.minapi) $('b_minapi').value=p.build_overrides.minapi;
   }
-  metaTags(p);
-  renderValidation(p);
-  refreshButtons();
-  $('out').scrollIntoView({behavior:'smooth',block:'nearest'});
+  metaTags(p); renderValidation(p); syncGutter(); refreshButtons(); updateUsage(p.usage);
+  $('livelint').textContent='';
+  if(p.repairs && p.repairs.length) toast(p.repairs.length+' issue(s) repaired for free','ok');
+  if(!quiet) $('out').scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 
 function collect(){
@@ -2085,117 +3469,250 @@ function collect(){
   var archs=[];
   if($('arch_a64').checked) archs.push('arm64-v8a');
   if($('arch_a32').checked) archs.push('armeabi-v7a');
-  cur.archs = archs.join(',')||'arm64-v8a';
-  cur.build_overrides = {api:$('b_api').value.trim(), minapi:$('b_minapi').value.trim(), orientation:cur.orientation};
+  cur.archs=archs.join(',')||'arm64-v8a';
+  cur.build_overrides={api:$('b_api').value.trim(), minapi:$('b_minapi').value.trim(),
+                       orientation:cur.orientation};
   return cur;
 }
 
-function reval(){
-  // local re-validation pass after manual edits (server is source of truth on build)
+/* ---------------------------------------------------------------- usage meter */
+function updateUsage(u){
+  if(!u) return;
+  var n=u.total||0;
+  var txt=(n>=1000?(n/1000).toFixed(1)+'k':n)+' tok';
+  var extra=[];
+  if(u.calls) extra.push(u.calls+' calls');
+  if(u.cached) extra.push(u.cached+' cached');
+  $('tokpill').innerHTML='<span class="dot"></span><b>'+txt+'</b>'+
+    (extra.length?' &middot; '+extra.join(' &middot; '):'');
+  $('tokpill').title='session total: '+n+' tokens'+
+    (u.saved?('  |  ~'+u.saved+' tokens saved by the cache'):'');
+}
+async function loadUsage(){
+  try{ var r=await fetch('/api/usage'); var d=await r.json();
+    updateUsage(d.usage);
+    if(d.budget) $('tokpill').title += '  |  budget '+d.budget+', '+d.left+' left';
+  }catch(e){}
+}
+
+/* ---------------------------------------------------------------- live lint */
+function scheduleLint(){
+  if(lintT) clearTimeout(lintT);
+  $('livelint').textContent='checking...';
+  lintT=setTimeout(runLint, 550);
+}
+async function runLint(){
   if(!cur) return;
   collect();
+  try{
+    var r=await fetch('/api/lint',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements,
+                           permissions:cur.permissions})});
+    var d=await r.json();
+    cur.syntax_ok=d.syntax_ok; cur.syntax_msg=d.syntax_msg;
+    cur.issues=d.issues; cur.errors=d.errors; cur.warnings=d.warnings;
+    cur.repairs=[];
+    metaTags(cur); renderValidation(cur);
+    var ne=(d.errors||[]).length;
+    $('livelint').innerHTML = !d.syntax_ok ? '<span style="color:var(--danger)">syntax error</span>'
+      : (ne? '<span style="color:var(--danger)">'+ne+' blocking</span>'
+           : '<span style="color:var(--green)">clean</span>');
+  }catch(e){ $('livelint').textContent=''; }
+}
+
+/* ---------------------------------------------------------------- AI actions */
+function refine(text){
+  if(!cur || !(cur.main_py||'').trim()){
+    $('desc').value=(($('desc').value||'')+' '+text).trim(); $('desc').focus(); return;
+  }
+  $('desc').value=text;
+  forge();
 }
 
 async function forge(){
   var desc=$('desc').value.trim();
   if(!desc){ $('desc').focus(); return; }
-  var btn=$('forgeBtn'); btn.disabled=true; var old=btn.textContent; btn.innerHTML='<span class="spin"></span> forging...';
-  history.push({role:'user', content:desc});
+  var done=busy('forgeBtn','forging');
+  turns.push(desc);
   try{
     var r=await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({description:desc, history:history.slice(0,-1)})});
+      body:JSON.stringify({description:desc,
+        history:turns.slice(0,-1).map(function(t){return {role:'user',content:t};}),
+        main_py:(cur&&cur.main_py)||''})});
     var d=await r.json();
-    if(!r.ok){ alert(d.error||('forge failed ('+r.status+')')); return; }
-    if(d.raw) history.push({role:'assistant', content:d.raw});
+    if(!r.ok){ toast(d.error||('forge failed ('+r.status+')'),'bad'); return; }
     render(d);
-  }catch(e){ alert('network: '+e); }
-  finally{ btn.disabled=false; btn.textContent=old; }
+    toast('forged "'+(d.title||d.name)+'"','ok');
+  }catch(e){ toast('network: '+e,'bad'); }
+  finally{ done(); }
 }
 
-async function loadTemplate(force){
-  var id = force || $('tpl_sel').value;
+/* The whole pipeline: forge -> free repair -> static gate -> self-test -> fix -> repeat. */
+async function autoForge(){
+  var desc=$('desc').value.trim();
+  if(!desc && !(cur&&cur.main_py)){ $('desc').focus(); return; }
+  if(desc) turns.push(desc);
+  var done=busy('autoBtn','running');
+  show('agentwrap'); show('agentbar');
+  $('rail').innerHTML=''; $('agentstat').textContent='starting';
+  $('agentwrap').scrollIntoView({behavior:'smooth',block:'nearest'});
   try{
-    var r=await fetch('/api/template?id='+encodeURIComponent(id));
+    var body={description:desc};
+    if(!desc && cur){ collect(); body.main_py=cur.main_py; body.name=cur.name;
+      body.title=cur.title; body.requirements=cur.requirements;
+      body.permissions=cur.permissions; body.orientation=cur.orientation; }
+    var r=await fetch('/api/autoforge',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
     var d=await r.json();
-    if(!r.ok){ alert(d.error||'template failed'); return; }
-    history=[];
-    render(d);
-  }catch(e){ alert('network: '+e); }
+    if(!r.ok){ toast(d.error||'could not start','bad'); done(); hide('agentbar'); return; }
+    pollJob(d.job_id, done);
+  }catch(e){ toast('network: '+e,'bad'); done(); hide('agentbar'); }
+}
+
+var ICONS={ok:'\u2713', fail:'\u2717', warn:'!', step:'\u203A', info:'\u00B7'};
+function pollJob(jid, done){
+  if(jobT) clearInterval(jobT);
+  var seen=0;
+  jobT=setInterval(async function(){
+    try{
+      var r=await fetch('/api/job?id='+jid); var d=await r.json();
+      var steps=d.steps||[];
+      if(steps.length!==seen){
+        $('rail').innerHTML=steps.map(function(s){
+          return '<div class="stepr '+(s.kind||'info')+'"><div class="ic">'+
+            (ICONS[s.kind]||'\u00B7')+'</div><div class="tx">'+esc(s.text)+'</div></div>';
+        }).join('');
+        $('rail').scrollTop=$('rail').scrollHeight;
+        seen=steps.length;
+      }
+      $('agentstat').textContent = d.status==='running'
+        ? ('round '+(d.round||1)) : d.status;
+      updateUsage(d.usage);
+      if(d.phases && d.phases.length) renderPhases(d.phases);
+      if(d.status!=='running'){
+        clearInterval(jobT); jobT=null; hide('agentbar');
+        if(d.payload) render(d.payload);
+        if(d.status==='done') toast('verified \u2014 self-test passed, ready to build','ok');
+        else if(d.status==='stalled') toast('stopped early to save tokens \u2014 see the rail','warn');
+        else toast(d.error||'the run failed','bad');
+        done();
+      }
+    }catch(e){ clearInterval(jobT); jobT=null; hide('agentbar'); done(); }
+  }, 900);
 }
 
 async function autoFix(){
   if(!cur) return; collect();
-  var btn=$('fixBtn'); btn.disabled=true; var old=btn.textContent; btn.innerHTML='<span class="spin"></span> fixing...';
+  var done=busy('fixBtn','fixing');
   try{
-    var err=(cur.issues||[]).filter(function(i){return i.sev==='error'||i.sev==='warn';}).map(function(i){return i.msg;}).join('\n');
+    var err=(cur.test_error||'')||
+      (cur.issues||[]).filter(function(i){return i.sev==='error'||i.sev==='warn';})
+        .map(function(i){return '- '+i.msg;}).join('\n');
     var r=await fetch('/api/fix',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements, permissions:cur.permissions, error:err})});
+      body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements,
+                           permissions:cur.permissions, error:err})});
     var d=await r.json();
-    if(!r.ok){ alert(d.error||'fix failed'); return; }
+    if(!r.ok){ toast(d.error||'fix failed','bad'); return; }
+    d.name=cur.name||d.name; d.title=cur.title||d.title;
+    render(d); toast('fix applied \u2014 re-run the self-test','ok');
+  }catch(e){ toast('network: '+e,'bad'); }
+  finally{ done(); }
+}
+
+async function localRepair(){
+  if(!cur) return; collect();
+  var done=busy('repairBtn','repairing');
+  try{
+    var r=await fetch('/api/repair',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(cur)});
+    var d=await r.json();
+    if(!r.ok){ toast(d.error||'repair failed','bad'); return; }
     render(d);
-  }catch(e){ alert('network: '+e); }
-  finally{ btn.disabled=false; btn.textContent=old; }
+    if(!(d.repairs||[]).length) toast('nothing a local pass could fix','warn');
+  }catch(e){ toast('network: '+e,'bad'); }
+  finally{ done(); }
 }
 
 async function polish(){
   if(!cur) return; collect();
-  var btn=$('polishBtn'); btn.disabled=true; var old=btn.textContent; btn.innerHTML='<span class="spin"></span> polishing...';
+  var done=busy('polishBtn','polishing');
   try{
     var r=await fetch('/api/polish',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements, permissions:cur.permissions})});
+      body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements,
+                           permissions:cur.permissions})});
     var d=await r.json();
-    if(!r.ok){ alert(d.error||'polish failed'); return; }
-    render(d);
-  }catch(e){ alert('network: '+e); }
-  finally{ btn.disabled=false; btn.textContent=old; }
+    if(!r.ok){ toast(d.error||'polish failed','bad'); return; }
+    d.name=cur.name||d.name; d.title=cur.title||d.title;
+    render(d); toast('restyled','ok');
+  }catch(e){ toast('network: '+e,'bad'); }
+  finally{ done(); }
+}
+
+/* ---------------------------------------------------------------- self-test */
+function renderPhases(ph){
+  $('phases').innerHTML=(ph||[]).map(function(p){
+    return '<span class="ph '+(p.ok?'ok':'bad')+'" title="'+esc(p.detail||'')+'">'+
+      (p.ok?'\u2713':'\u2717')+' '+esc(p.name)+'</span>';
+  }).join('');
 }
 
 async function testRun(){
   if(!cur) return; collect();
-  show('testpanel'); $('testout').textContent='starting test run...';
-  var btn=$('testBtn'); btn.disabled=true; var old=btn.textContent; btn.innerHTML='<span class="spin"></span> testing...';
+  if(!(cur.main_py||'').trim()){ toast('nothing to test yet','warn'); return; }
+  show('testpanel'); $('testout').textContent='starting self-test...'; $('phases').innerHTML='';
+  var done=busy('testBtn','testing');
   try{
     var r=await fetch('/api/testrun',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements})});
     var d=await r.json();
-    if(!r.ok){ $('testout').textContent=d.error||'test failed'; btn.disabled=false; btn.textContent=old; return; }
-    pollTest(d.test_id, btn, old);
-  }catch(e){ $('testout').textContent='network: '+e; btn.disabled=false; btn.textContent=old; }
+    if(!r.ok){ $('testout').textContent=d.error||'test failed'; toast(d.error||'test failed','bad');
+      done(); return; }
+    pollTest(d.test_id, done);
+  }catch(e){ $('testout').textContent='network: '+e; done(); }
 }
 
-function pollTest(tid, btn, old){
+function pollTest(tid, done){
   if(testT) clearInterval(testT);
   testT=setInterval(async function(){
     try{
       var r=await fetch('/api/testlog?id='+tid); var d=await r.json();
-      $('testout').textContent=(d.log||'')+'\n';
+      $('testout').textContent=(d.log||'');
       $('testout').scrollTop=$('testout').scrollHeight;
+      if(d.phases && d.phases.length) renderPhases(d.phases);
       if(d.status && d.status!=='running'){
         clearInterval(testT); testT=null;
-        btn.disabled=false; btn.textContent=old;
+        if(cur) cur.test_error=d.error_text||'';
+        if(d.status==='pass') toast('self-test passed \u2014 safe to build','ok');
+        else if(d.status==='fail') toast('self-test failed \u2014 hit Auto-fix to send the traceback back','bad');
+        else toast(d.summary||d.status,'warn');
+        done();
       }
-    }catch(e){ clearInterval(testT); testT=null; btn.disabled=false; btn.textContent=old; }
+    }catch(e){ clearInterval(testT); testT=null; done(); }
   }, 700);
 }
 
+/* ---------------------------------------------------------------- build */
 async function buildApk(){
   if(!cur) return; collect();
+  if(!(cur.main_py||'').trim()){ toast('nothing to build yet','warn'); return; }
   if(cur.errors && cur.errors.length){
-    if(!confirm('There are '+cur.errors.length+' blocking error(s). The server will refuse the build. Continue anyway?')) return;
+    if(!confirm(cur.errors.length+' blocking error(s) \u2014 the server will refuse this build.\n\n'+
+      cur.errors.slice(0,4).join('\n')+'\n\nTry anyway?')) return;
   }
-  var btn=$('buildBtn'); btn.disabled=true; var old=btn.textContent; btn.innerHTML='<span class="spin"></span> starting...';
+  var done=busy('buildBtn','starting');
   hide('apkBtn');
   try{
-    var r=await fetch('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cur)});
+    var r=await fetch('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(cur)});
     var d=await r.json();
-    if(!r.ok){ alert(d.error||'build refused'); btn.disabled=false; btn.textContent=old; return; }
+    if(!r.ok){ toast(d.error||'build refused','bad'); done(); return; }
     show('logwrap'); $('log').textContent='build started ('+d.build_id+')...\n';
     $('logwrap').scrollIntoView({behavior:'smooth',block:'nearest'});
-    pollBuild(d.build_id, btn, old);
-  }catch(e){ alert('network: '+e); btn.disabled=false; btn.textContent=old; }
+    pollBuild(d.build_id, done);
+  }catch(e){ toast('network: '+e,'bad'); done(); }
 }
 
-function pollBuild(bid, btn, old){
+function pollBuild(bid, done){
   if(pollT) clearInterval(pollT);
   pollT=setInterval(async function(){
     try{
@@ -2203,46 +3720,42 @@ function pollBuild(bid, btn, old){
       $('log').textContent=d.log||'';
       $('log').scrollTop=$('log').scrollHeight;
       if(d.status==='done' || d.status==='failed'){
-        clearInterval(pollT); pollT=null;
-        btn.disabled=false; btn.textContent=old;
-        if(d.status==='done' && d.apk){ window._apkId=bid; show('apkBtn'); }
+        clearInterval(pollT); pollT=null; done();
+        if(d.status==='done' && d.apk){ window._apkId=bid; show('apkBtn');
+          toast('APK ready','ok'); }
+        else toast('build failed \u2014 check the log','bad');
       }
-    }catch(e){ clearInterval(pollT); pollT=null; btn.disabled=false; btn.textContent=old; }
+    }catch(e){ clearInterval(pollT); pollT=null; done(); }
   }, 1500);
 }
 
-function downloadApk(){
-  if(!window._apkId) return;
-  window.location='/api/apk?id='+window._apkId;
-}
+function downloadApk(){ if(window._apkId) window.location='/api/apk?id='+window._apkId; }
 
 async function downloadProject(){
   if(!cur) return; collect();
   try{
-    var r=await fetch('/api/project_zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cur)});
-    if(!r.ok){ var e=await r.json(); alert('zip error: '+(e.error||r.status)); return; }
+    var r=await fetch('/api/project_zip',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(cur)});
+    if(!r.ok){ var e=await r.json(); toast('zip error: '+(e.error||r.status),'bad'); return; }
     var blob=await r.blob();
     var a=document.createElement('a');
     a.href=URL.createObjectURL(blob);
     a.download=(cur.name||'app')+'_buildozer.zip';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(function(){URL.revokeObjectURL(a.href);},1000);
-  }catch(e){ alert('network: '+e); }
+    toast('project downloaded','ok');
+  }catch(e){ toast('network: '+e,'bad'); }
 }
 
-function refreshButtons(){
-  var has = !!cur;
-  ['buildBtn','testBtn','fixBtn','polishBtn','zipBtn'].forEach(function(id){ $(id).disabled = !has; });
-}
-
-async function loadDoctor(){
+/* ---------------------------------------------------------------- templates */
+async function loadTemplate(force){
+  var id=force||$('tpl_sel').value;
   try{
-    var r=await fetch('/api/doctor'); var d=await r.json();
-    var html=(d.checks||[]).map(function(c){
-      return '<span class="tag '+(c[1]?'ok':'bad')+'">'+(c[1]?'\u2713 ':'\u2717 ')+esc(c[0])+'</span>';
-    }).join('');
-    $('doctor').innerHTML=html||'<span class="tag">no checks</span>';
-  }catch(e){ $('doctor').innerHTML='<span class="tag bad">doctor failed</span>'; }
+    var r=await fetch('/api/template?id='+encodeURIComponent(id));
+    var d=await r.json();
+    if(!r.ok){ toast(d.error||'template failed','bad'); return; }
+    turns=[]; render(d);
+  }catch(e){ toast('network: '+e,'bad'); }
 }
 
 async function loadTemplates(){
@@ -2250,61 +3763,132 @@ async function loadTemplates(){
     var r=await fetch('/api/templates'); var d=await r.json();
     var sel=$('tpl_sel'); sel.innerHTML='';
     (d.templates||[]).forEach(function(t){
-      var o=document.createElement('option'); o.value=t.id; o.textContent=t.label+' -- '+t.desc; sel.appendChild(o);
+      var o=document.createElement('option');
+      o.value=t.id; o.textContent=t.label+' \u2014 '+t.desc;
+      sel.appendChild(o);
     });
+    sel.value='kit';
   }catch(e){}
 }
 
+function refreshButtons(){
+  var has=!!cur, hasCode=has && (($('code').value||'').trim().length>0);
+  ['buildBtn','testBtn','fixBtn','polishBtn','zipBtn','repairBtn'].forEach(function(id){
+    var b=$(id); if(b && !b.querySelector('.spin')) b.disabled=!hasCode;
+  });
+}
+
+/* ---------------------------------------------------------------- doctor */
+function toggleDoctor(){ $('doctor').classList.toggle('open'); }
+async function loadDoctor(){
+  try{
+    var r=await fetch('/api/doctor'); var d=await r.json();
+    var checks=d.checks||[];
+    $('doctor').innerHTML=checks.map(function(c){
+      return '<span class="pill '+(c[1]?'ok':'bad')+'"><span class="dot"></span>'+esc(c[0])+'</span>';
+    }).join('')||'<span class="pill">no checks</span>';
+    var okN=checks.filter(function(c){return c[1];}).length;
+    var bad=checks.length-okN;
+    var sum=$('docsum');
+    sum.className='pill '+(bad?'warn':'ok');
+    sum.innerHTML='<span class="dot"></span>environment <b>'+okN+'/'+checks.length+'</b>'+
+      (bad?' \u25BE':' \u25BE');
+    sum.title=bad? bad+' check(s) need attention \u2014 click for detail'
+                 : 'everything the forge needs is installed';
+  }catch(e){ $('docsum').innerHTML='<span class="dot"></span>doctor failed';
+             $('docsum').className='pill bad'; }
+}
+
+/* ---------------------------------------------------------------- settings */
 function onModelChange(){
-  var sel=$('sf_model_sel'), cust=$('sf_model_custom');
-  if(sel.value==='__custom__'){ cust.classList.remove('hidden'); cust.focus(); } else { cust.classList.add('hidden'); }
+  var sel=$('sf_model_sel'), c=$('sf_model_custom');
+  if(sel.value==='__custom__'){ c.classList.remove('hidden'); c.focus(); }
+  else c.classList.add('hidden');
 }
 async function openSettings(){
   try{
     var r=await fetch('/api/config'); var d=await r.json();
-    var sel=$('sf_model_sel'), cust=$('sf_model_custom');
-    var m=d.sf_model||'deepseek-ai/DeepSeek-V4-Flash', found=false;
+    var sel=$('sf_model_sel'), c=$('sf_model_custom');
+    var m=d.sf_model||'', found=false;
     for(var i=0;i<sel.options.length;i++){ if(sel.options[i].value===m){found=true;break;} }
-    if(found){ sel.value=m; cust.classList.add('hidden'); cust.value=''; }
-    else { sel.value='__custom__'; cust.classList.remove('hidden'); cust.value=m; }
+    if(found){ sel.value=m; c.classList.add('hidden'); c.value=''; }
+    else { sel.value='__custom__'; c.classList.remove('hidden'); c.value=m; }
     if(d.sf_url) $('sf_url').value=d.sf_url;
     if(d.groq_model) $('groq_model').value=d.groq_model;
     if(d.groq_url) $('groq_url').value=d.groq_url;
+    $('max_tokens').value=d.max_tokens; $('token_budget').value=d.token_budget;
+    $('agent_rounds').value=d.agent_rounds;
+    $('cache').checked=!!d.cache; $('auto_repair').checked=!!d.auto_repair;
     $('sf_key').value=''; $('groq_key').value='';
     $('clear_sf').checked=false; $('clear_groq').checked=false;
     $('sfset').textContent=d.sf_key_set?'(stored)':(d.sf_env?'(from env)':'(not set)');
-    $('gqset').textContent=d.groq_key_set?'(stored)':(d.groq_env?'(from env)':'');
+    $('gqset').textContent=d.groq_key_set?'(stored)':(d.groq_env?'(from env)':'(not set)');
     $('setmsg').textContent='';
+    var u=await (await fetch('/api/usage')).json();
+    $('usagenote').textContent='this session: '+(u.usage.total||0)+' tokens over '+
+      (u.usage.calls||0)+' calls'+(u.usage.cached?(', '+u.usage.cached+' served from cache'):'');
   }catch(e){}
   show('settings');
 }
 function closeSettings(){ hide('settings'); }
-function overlayClick(e){ if(e.target && e.target.id==='settings'){ closeSettings(); } }
+function overlayClick(e){ if(e.target && e.target.id==='settings') closeSettings(); }
+
 async function saveSettings(){
   var sel=$('sf_model_sel');
   var model=(sel.value==='__custom__')?$('sf_model_custom').value.trim():sel.value;
-  var body={ sf_key:$('sf_key').value, groq_key:$('groq_key').value, sf_model:model,
+  var body={sf_key:$('sf_key').value, groq_key:$('groq_key').value, sf_model:model,
     sf_url:$('sf_url').value, groq_model:$('groq_model').value, groq_url:$('groq_url').value,
-    clear_sf:$('clear_sf').checked, clear_groq:$('clear_groq').checked };
+    clear_sf:$('clear_sf').checked, clear_groq:$('clear_groq').checked,
+    max_tokens:parseInt($('max_tokens').value||'12000',10),
+    token_budget:parseInt($('token_budget').value||'0',10),
+    agent_rounds:parseInt($('agent_rounds').value||'3',10),
+    cache:$('cache').checked, auto_repair:$('auto_repair').checked};
   try{
-    var r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
     var d=await r.json();
     $('setmsg').textContent=d.saved?'saved':'save failed (check ~/.androdawg perms)';
     loadDoctor();
-    if(d.saved) setTimeout(closeSettings,500);
+    if(d.saved){ toast('settings saved','ok'); setTimeout(closeSettings,450); }
   }catch(e){ $('setmsg').textContent='error: '+e; }
+}
+
+async function clearCache(){
+  try{ var r=await fetch('/api/cache_clear',{method:'POST'}); var d=await r.json();
+    toast('cleared '+d.removed+' cached response(s)','ok'); }
+  catch(e){ toast('network: '+e,'bad'); }
 }
 
 async function quitApp(){
   try{ await fetch('/api/quit',{method:'POST'}); }catch(e){}
-  document.body.innerHTML='<div style="color:#6e8070;font-family:ui-monospace,monospace;padding:48px;font-size:14px">The Dawg stopped. You can close this window.</div>';
+  document.body.innerHTML='<div style="color:#546274;font-family:system-ui;padding:56px;'+
+    'font-size:15px">The Dawg stopped. You can close this window.</div>';
   setTimeout(function(){ try{window.close();}catch(e){} },400);
 }
 
-$('desc').addEventListener('keydown', function(e){ if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ forge(); } });
-$('code').addEventListener('input', function(){ if(cur){ collect(); } });
-document.addEventListener('keydown', function(e){ if(e.key==='Escape'){ closeSettings(); } });
-loadDoctor(); loadTemplates(); refreshButtons();
+/* ---------------------------------------------------------------- wiring */
+$('desc').addEventListener('keydown', function(e){
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter') forge(); });
+$('code').addEventListener('input', function(){ syncGutter(); scheduleLint(); refreshButtons(); });
+$('code').addEventListener('scroll', function(){ $('gutter').scrollTop=this.scrollTop; });
+$('code').addEventListener('keydown', function(e){
+  if(e.key==='Tab'){                       // a code editor that eats Tab is not an editor
+    e.preventDefault();
+    var s=this.selectionStart, en=this.selectionEnd;
+    this.value=this.value.slice(0,s)+'    '+this.value.slice(en);
+    this.selectionStart=this.selectionEnd=s+4;
+    syncGutter();
+  }
+});
+document.addEventListener('click', function(e){
+  if(!e.target.closest('.docwrap')) $('doctor').classList.remove('open'); });
+document.addEventListener('keydown', function(e){
+  if(e.key==='Escape'){ closeSettings(); $('doctor').classList.remove('open'); }
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'){ e.preventDefault(); if(cur) testRun(); }
+});
+
+loadDoctor(); loadTemplates(); loadUsage(); refreshButtons();
+setInterval(loadUsage, 15000);
 </script>
 </body>
 </html>

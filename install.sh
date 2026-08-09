@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# THE DAWG // APK FORGE v2 - one-shot installer
+# THE DAWG // APK FORGE v3 - one-shot installer
 # Wipes any old install, pulls everything from GitHub, installs all deps + JDK 17.
-# v2 adds: manual mode, AI custom buildozer.spec, headless test-run, auto-fix/polish,
+# v3 adds: generated kit-API contract (no more phantom Theme attrs), zero-token local
+#          repair, kit-stripped AI calls + token metering/budget, an 8-phase self-test
+#          that taps every button, the forge-and-verify agent loop, and a rebuilt UI.
+# v2 added: manual mode, AI custom buildozer.spec, headless test-run, auto-fix/polish,
 # pro icon + presplash, and an own-icon app window (no more "looks like a Brave tab").
 # Run:  curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
 set -u
@@ -24,7 +27,7 @@ else
   SRC_DIR=""
 fi
 
-echo "[dawg] ===== The Dawg // APK Forge v2 installer ====="
+echo "[dawg] ===== The Dawg // APK Forge v3 installer ====="
 
 # 1) clean old install (keep saved API keys), then recreate
 echo "[dawg] removing old install (keeping your saved settings)..."
