@@ -58,6 +58,14 @@ HOST = "127.0.0.1"
 PORT = 8731
 
 SF_URL = "https://api.siliconflow.cn/v1/chat/completions"
+# SiliconFlow runs two SEPARATE platforms with separate accounts/keys: the China
+# site (siliconflow.cn) and the international site (siliconflow.com). A key minted
+# on one is meaningless on the other's API and comes back as a plain 401 "invalid/
+# expired key" -- indistinguishable from an actually-bad key. If the primary host
+# rejects the key with 401/403, we retry once against this sibling host before
+# giving up, so a .com-issued key still works against the .cn-hardcoded default
+# (and vice versa) without the user having to know this platform split exists.
+SF_URL_ALT = "https://api.siliconflow.com/v1/chat/completions"
 SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -1712,22 +1720,36 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
     errs = []
     if sf:
         sf_u = chat_url(CONFIG.get("sf_url") or SF_URL)
-        try:
-            d = _post_json(sf_u, sf, {
-                "model": model, "messages": messages,
-                "temperature": temperature, "max_tokens": max_tokens,
-            })
-            text = d["choices"][0]["message"]["content"]
-            u = d.get("usage") or {}
-            meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
-                  u.get("completion_tokens") or est_tokens(text))
-            prov = "SiliconFlow / " + model
-            cache_put(key, text, prov)
-            return text, prov
-        except urllib.error.HTTPError as e:
-            errs.append(_provider_error("SiliconFlow", e, model))
-        except Exception as e:
-            errs.append("SiliconFlow (%s): %s" % (sf_u, e))
+        # Only auto-try the sibling .cn/.com host when the user hasn't explicitly
+        # pointed sf_url at something custom -- don't second-guess a real override.
+        sf_u_alt = chat_url(SF_URL_ALT) if sf_u == chat_url(SF_URL) else \
+                   (chat_url(SF_URL) if sf_u == chat_url(SF_URL_ALT) else None)
+        candidates = [sf_u] + ([sf_u_alt] if sf_u_alt else [])
+        for i, u in enumerate(candidates):
+            try:
+                d = _post_json(u, sf, {
+                    "model": model, "messages": messages,
+                    "temperature": temperature, "max_tokens": max_tokens,
+                })
+                text = d["choices"][0]["message"]["content"]
+                usage = d.get("usage") or {}
+                meter(usage.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
+                      usage.get("completion_tokens") or est_tokens(text))
+                prov = "SiliconFlow / " + model
+                if i > 0:
+                    prov += "  [via %s -- your key wasn't valid on %s, remembered for next time]" % (u, candidates[0])
+                    CONFIG["sf_url"] = u
+                    save_config(CONFIG)
+                cache_put(key, text, prov)
+                return text, prov
+            except urllib.error.HTTPError as e:
+                msg = _provider_error("SiliconFlow", e, model)
+                is_key_reject = e.code in (401, 403) and "allowlist" not in msg.lower() and "egress" not in msg.lower()
+                if is_key_reject and i < len(candidates) - 1:
+                    continue  # try the sibling host before giving up on this key
+                errs.append(msg)
+            except Exception as e:
+                errs.append("SiliconFlow (%s): %s" % (u, e))
     if gq:
         gq_u = chat_url(CONFIG.get("groq_url") or GROQ_URL)
         gq_model = CONFIG.get("groq_model") or GROQ_MODEL
@@ -3130,13 +3152,98 @@ INDEX_HTML = r"""<!doctype html>
     display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .empty{text-align:center;padding:44px 20px;color:var(--dim)}
   .empty .big{font-size:38px;opacity:.35;margin-bottom:10px}
+
+  /* =====================================================================
+     POLISH PASS -- purely additive/overriding visual layer. No selector
+     here changes an id/class the JS depends on; this only makes the
+     existing structure look sharper (motion, depth, glow, gradients).
+     ===================================================================== */
+
+  /* ambient animated mesh behind everything, fixed so it doesn't affect layout/scroll math */
+  body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+    background:
+      radial-gradient(900px 520px at 82% -8%, rgba(67,200,245,.14), transparent 60%),
+      radial-gradient(760px 480px at 4% 0%, rgba(139,124,246,.12), transparent 58%),
+      radial-gradient(680px 520px at 60% 108%, rgba(61,220,132,.07), transparent 60%);
+    background-size:180% 180%,180% 180%,180% 180%;
+    animation:meshdrift 26s ease-in-out infinite alternate}
+  @keyframes meshdrift{
+    0%{background-position:0% 0%,100% 0%,50% 100%}
+    100%{background-position:12% 14%,88% 10%,44% 92%}
+  }
+  /* faint grain so flat dark panels don't look plasticky */
+  body::after{content:"";position:fixed;inset:0;z-index:90;pointer-events:none;opacity:.035;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>")}
+
+  header{box-shadow:0 1px 0 rgba(255,255,255,.03) inset}
+  header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
+    background:linear-gradient(90deg,transparent,var(--cyan),var(--violet),var(--green),transparent);
+    background-size:300% 100%;opacity:.55;animation:hbar 9s linear infinite}
+  @keyframes hbar{0%{background-position:0% 0%}100%{background-position:300% 0%}}
+
+  .logo{position:relative;box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55),
+      0 0 22px -4px rgba(139,124,246,.55);
+    animation:logoglow 3.2s ease-in-out infinite}
+  @keyframes logoglow{
+    0%,100%{box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55),0 0 16px -4px rgba(139,124,246,.45)}
+    50%{box-shadow:0 0 0 1px rgba(139,124,246,.45),0 8px 24px -6px rgba(139,124,246,.75),0 0 26px -2px rgba(67,200,245,.65)}
+  }
+  .brandtxt{background:linear-gradient(90deg,var(--txt) 0%,var(--cyan) 22%,var(--violet) 44%,var(--txt) 66%,var(--cyan) 88%,var(--txt) 100%);
+    background-size:260% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+    animation:shimmer 7s linear infinite}
+  @keyframes shimmer{0%{background-position:0% 0%}100%{background-position:260% 0%}}
+
+  .panel{position:relative;isolation:isolate;transition:box-shadow .25s ease,border-color .25s ease,transform .25s ease;
+    animation:panelin .32s cubic-bezier(.2,.8,.2,1)}
+  @keyframes panelin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .panel::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;z-index:-1;
+    background:linear-gradient(160deg,rgba(67,200,245,.28),rgba(139,124,246,.14) 35%,transparent 60%);
+    -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+    -webkit-mask-composite:xor;mask-composite:exclude;opacity:.55;pointer-events:none}
+  .panel:hover{box-shadow:var(--sh),0 0 0 1px rgba(67,200,245,.08)}
+
+  .tabs{position:relative;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}
+  .tab{position:relative}
+  .tab.active{box-shadow:0 4px 18px -6px rgba(67,200,245,.85),0 0 0 1px rgba(255,255,255,.06) inset}
+
+  button.primary,button.accent,button.violet{position:relative;overflow:hidden}
+  button.primary::before,button.accent::before,button.violet::before{
+    content:"";position:absolute;top:0;left:-60%;width:40%;height:100%;
+    background:linear-gradient(115deg,transparent,rgba(255,255,255,.5),transparent);
+    transform:skewX(-18deg);transition:left .55s ease}
+  button.primary:hover:not(:disabled)::before,button.accent:hover:not(:disabled)::before,
+  button.violet:hover:not(:disabled)::before{left:130%}
+  button.primary:hover:not(:disabled),button.accent:hover:not(:disabled),button.violet:hover:not(:disabled){
+    transform:translateY(-1.5px) scale(1.012)}
+  button:active:not(:disabled){transform:translateY(0) scale(.985) !important}
+
+  .pill.ok .dot{animation:dotpulse 1.7s ease-in-out infinite}
+  @keyframes dotpulse{0%,100%{box-shadow:0 0 4px currentColor}50%{box-shadow:0 0 12px currentColor}}
+  .pill{transition:border-color .18s,transform .18s}
+  .chip:hover:not(:disabled){transform:translateY(-1px)}
+
+  .bar i{background:linear-gradient(90deg,var(--cyan),var(--violet),var(--green),var(--cyan));
+    background-size:300% 100%;animation:sl 1.1s ease-in-out infinite,barhue 3.6s linear infinite}
+  @keyframes barhue{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(30deg)}}
+
+  .modal{animation:modalin .22s cubic-bezier(.2,.8,.2,1)}
+  @keyframes modalin{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+  .overlay{animation:ovin .18s ease-out}
+  @keyframes ovin{from{opacity:0}to{opacity:1}}
+
+  ::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#233247,#1a2635)}
+  ::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#345070,#243549)}
+
+  @media (prefers-reduced-motion: reduce){
+    body::before,.logo,.brandtxt,header::after,.bar i,.panel,.pill.ok .dot{animation:none !important}
+  }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">
     <div class="logo">D</div>
-    <span>THE DAWG <em>// APK FORGE</em></span>
+    <span><b class="brandtxt">THE DAWG</b> <em>// APK FORGE</em></span>
     <span class="ver">v3.0</span>
   </div>
   <span class="grow"></span>
