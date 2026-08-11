@@ -64,6 +64,38 @@ Add your SiliconFlow key in **Settings (⚙)**, type what you want, hit **Forge 
 
 ---
 
+## What's new in v3.1
+
+**Runs great on CachyOS / Arch.** The installer now auto-detects your package manager —
+`pacman` on CachyOS/Arch/Manjaro/EndeavourOS (first-class), with `apt`, `dnf` and `zypper`
+kept as fallbacks. On Arch it pulls `jdk17-openjdk` and `xorg-server-xvfb` straight from the
+official repos, and because Arch's xvfb ships `Xvfb` but not the `xvfb-run` wrapper, the
+self-test now launches `Xvfb` itself — so the pre-build crash check works on CachyOS
+(including Wayland/KDE) out of the box. Every "install X" hint prints the right `pacman`
+command instead of a useless `apt` one.
+
+**The `class App(App)` crash is fixed for good.** Models love to name their class `App`,
+which shadows Kivy's own `App` and failed the self-test with *"no App subclass found"* every
+round. **Repair free** now rewrites that collision automatically at zero tokens, the self-test
+finds the app no matter what it's named, and the kit tolerates the bad constructor kwargs
+(`Card(fill=True)`, `GradientBackground(strips=[])`, stray layout kwargs) that used to crash
+`build()`.
+
+**📱 Preview before you build.** One click opens your app in a window sized to a real Android
+screen — status bar, notch, rounded corners, home indicator and all — so you *see and tap*
+exactly what the phone will show, in two seconds, without the 20–40 minute Buildozer run.
+Pick from a dozen device profiles (Pixel, Galaxy, OnePlus, tablets). It's also a standalone
+tool: `python3 preview.py main.py --device galaxy_s24`.
+
+**Prettier icons.** A new `iconsmith` generates crisp squircle launcher icons with a real
+monogram, a round variant, adaptive foreground/background layers and a matching presplash —
+all in pure Python, no PIL, so nothing new ever has to survive python-for-android.
+
+New files alongside `apkforge.py`: `preview.py`, `devices.py`, `iconsmith.py`. Verify them
+with `python3 selftest_modules.py`.
+
+---
+
 ## Why v3 exists
 
 **v2 was lying to the model.**
@@ -91,6 +123,10 @@ self-test that launches the app for real and presses its buttons.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
 ```
+
+On **CachyOS / Arch** it uses `pacman` automatically (`jdk17-openjdk`, `xorg-server-xvfb`,
+`base-devel`, …); on Debian/Kali it uses `apt` + Temurin 17 exactly as before. You can also
+run it from a local checkout: `bash install.sh`.
 
 One paste, does everything:
 

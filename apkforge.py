@@ -62,12 +62,29 @@ SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "3.0"
+VERSION = "3.1"
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
 TESTDIR = os.path.join(WORKDIR, "testruns")
 CACHEDIR = os.path.join(WORKDIR, "aicache")
+
+# Optional sibling modules that ship next to apkforge.py: a nicer icon smith and a
+# phone-frame desktop preview. Everything is guarded so the tool still runs if someone
+# copied apkforge.py on its own -- it just falls back to the built-in asset generator and
+# hides the PREVIEW button.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+try:
+    import iconsmith as _iconsmith
+except Exception:
+    _iconsmith = None
+try:
+    import devices as _devices
+except Exception:
+    _devices = None
+_PREVIEW_PY = os.path.join(_HERE, "preview.py")
 
 # arm64 only -> covers every modern phone (incl. ROG Phone 5S / SD888+) and halves
 # build time. add ,armeabi-v7a here if you ever need to support 32-bit hardware.
@@ -170,7 +187,7 @@ def groq_key():
 # ----------------------------------------------------------------- UI KIT (prepended to forged apps)
 KIT_BEGIN = "# ===== DAWG UI KIT"
 KIT_END = "# ===== END DAWG UI KIT ====="
-KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=48, **kw):\n        super().__init__(**kw)\n        self._top = top or Theme.bg\n        self._bottom = bottom or Theme.bg2\n        self._strips = strips\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(fill or Theme.surface, radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft shadow: two translucent offset rects\n            Color(0, 0, 0, 0.22)\n            RoundedRectangle(pos=(self.x, self.y - dp(3)),\n                             size=(self.width, self.height), radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24):\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, halign="left", valign="middle")\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14):\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, halign="left", valign="top")\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n# ===== END DAWG UI KIT =====\n'
+KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\ndef _kit_col(c, fallback):\n    """Coerce anything into a valid RGBA colour, so a stray bool/None/str can\'t crash a\n    widget at build time. Accepts a 3/4-tuple, a #hex string, or falls back."""\n    try:\n        if isinstance(c, str) and c.strip():\n            return _hx(c)\n        if isinstance(c, (tuple, list)) and len(c) in (3, 4):\n            return tuple(list(c) + [1])[:4]\n    except Exception:\n        pass\n    return fallback\n\n\ndef _kit_int(v, fallback):\n    """Coerce to a positive int (for counts like gradient strips)."""\n    try:\n        v = int(v)\n        return v if v > 0 else fallback\n    except Exception:\n        return fallback\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=48, **kw):\n        super().__init__(**kw)\n        self._top = _kit_col(top, Theme.bg)\n        self._bottom = _kit_col(bottom, Theme.bg2)\n        self._strips = _kit_int(strips, 48)\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(_kit_col(fill, Theme.surface), radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft shadow: two translucent offset rects\n            Color(0, 0, 0, 0.22)\n            RoundedRectangle(pos=(self.x, self.y - dp(3)),\n                             size=(self.width, self.height), radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "middle")\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "top")\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n# ===== END DAWG UI KIT =====\n'
 
 
 def ensure_kit(code):
@@ -424,12 +441,24 @@ def presplash_png(name, size=720):
 
 
 def presplash_hex(name):
+    if _iconsmith is not None:
+        try:
+            return _iconsmith.presplash_hex(name)
+        except Exception:
+            pass
     _, _, _, bg, _ = _palette(name)
     return "#%02x%02x%02x" % bg
 
 
 def write_assets(project_dir, name):
-    """Generate icon.png + presplash.png into project_dir. Returns (icon_ok, splash_ok)."""
+    """Generate icon.png + presplash.png into project_dir. Returns (icon_ok, splash_ok).
+    Prefers the richer iconsmith (squircle + monogram + adaptive layers) when it's present,
+    and always falls back to the built-in generator so a build never fails for lack of it."""
+    if _iconsmith is not None:
+        try:
+            return _iconsmith.write_assets(project_dir, name, size=512, full_set=True)
+        except Exception:
+            pass  # fall through to the built-in
     icon_ok = splash_ok = False
     try:
         with open(os.path.join(project_dir, "icon.png"), "wb") as f:
@@ -460,7 +489,9 @@ SYSTEM_PROMPT = """You are The Dawg (APK edition), an elite Android app smith. T
 HARD RULES
 - Output a single self-contained app. No placeholders, no TODO, no "...". Real working code top to bottom.
 - Kivy ONLY. NEVER tkinter / PyQt / PySide / GTK(gi) / wx / curses / pygame -- none of them survive python-for-android.
-- Subclass App. Build your UI in build() returning a GradientBackground root with an AppBar + Card(s). Make it genuinely nice: clear hierarchy, generous spacing (dp), big touch targets (>= 48dp), obvious feedback on every tap. No dead grey default widgets.
+- Subclass App, but NEVER name your class `App`. `class App(App):` shadows Kivy's own App and fails to launch. Name it for the app, e.g. `class AlarmClockApp(App):`, and end the file with `if __name__ == "__main__":` then `AlarmClockApp().run()`.
+- Build your UI in build() returning a GradientBackground root with an AppBar + Card(s). Make it genuinely nice: clear hierarchy, generous spacing (dp), big touch targets (>= 48dp), obvious feedback on every tap. No dead grey default widgets.
+- ONLY pass constructor keywords that exist. The kit constructor signatures are listed in the API reference above; passing an invented keyword (e.g. Card(fill=True), GradientBackground(strips=[])) is a crash. Kit fill/top/bottom take an RGBA colour tuple or a Theme colour, never a bool; strips is an int. The helpers heading()/body() take (text, size=...) and return a Label -- style them via that Label, don't pass layout kwargs they don't accept.
 - Drive everything with touch + on-screen widgets. Do NOT assume a hardware keyboard (except TextField input).
 - Guard ALL android-only imports behind platform, and request runtime permissions only when actually used:
     from kivy.utils import platform
@@ -860,6 +891,11 @@ def analyze_code(code, requirements, permissions=""):
         if not has_app:
             add("warn", "no `class X(App)` found -> the app may not launch",
                 "Define an App subclass with a build() method.")
+        # `class App(App):` shadows kivy's App and fails to launch / self-test. Repair-free
+        # fixes this automatically, but flag it live so it's obvious what happened.
+        if re.search(r"(?m)^\s*class\s+App\s*\(\s*App\s*\)\s*:", code):
+            add("warn", "your App subclass is named `App`, which shadows kivy's App -> fails to launch",
+                "Rename it (e.g. class MyApp(App)) -- or just hit Repair free, which fixes this for you.")
         has_run = any(isinstance(n, ast.Attribute) and n.attr == "run" for n in ast.walk(tree))
         if not has_run and ".run(" not in code:
             add("warn", "no `.run()` call found -> the app may not start",
@@ -1188,6 +1224,21 @@ def auto_repair(code, requirements="", permissions=""):
     code = code or ""
     reqs = [x.strip() for x in (requirements or "").split(",") if x.strip()]
     perms = [x.strip().upper() for x in (permissions or "").replace(";", ",").split(",") if x.strip()]
+
+    # 0. THE App NAME-COLLISION. Models love to write `class App(App):` -- a subclass
+    #    named exactly `App`, shadowing kivy's own App. It looks fine but it breaks the
+    #    self-test's `.run()` capture and can make instantiate fail with "no App subclass
+    #    found". Fix it for free by aliasing the base import: the subclass keeps the name
+    #    `App`, the base becomes `_KivyApp`, and everything just works.
+    if re.search(r"(?m)^\s*class\s+App\s*\(\s*App\s*\)\s*:", code):
+        if re.search(r"(?m)^\s*from\s+kivy\.app\s+import\s+App\s*(?:#.*)?$", code):
+            code = re.sub(r"(?m)^(\s*)from\s+kivy\.app\s+import\s+App\s*(?:#.*)?$",
+                          r"\1from kivy.app import App as _KivyApp", code, count=1)
+        else:
+            code = "from kivy.app import App as _KivyApp\n" + code
+        code = re.sub(r"(?m)^(\s*class\s+App\s*\(\s*)App(\s*\)\s*:)", r"\1_KivyApp\2", code, count=1)
+        fixes.append("renamed the base App import to _KivyApp so `class App(App)` stops "
+                     "colliding with kivy's App (this was failing the self-test every run)")
 
     # 1. wrong-case / aliased Theme attributes -> the real ones
     def _theme_sub(m):
@@ -1994,41 +2045,68 @@ except Exception:
     print("DAWG_TEST_FAIL"); os._exit(1)
 
 # ---------------------------------------------------------------- phase 2: import
-# Run the module with .run() neutralised so we control the lifecycle ourselves.
+# Run the module with .run() neutralised so we control the lifecycle ourselves. We patch
+# in THREE places so a real Kivy loop can never actually start (which would block, or exit
+# the process): App.run, App.async_run, and the low-level kivy.base.runTouchApp. Whichever
+# entry point the app uses, we just record the instance instead of launching it.
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.base import EventLoop
+import kivy.base as _kbase
 
 _captured = {"app": None}
 _real_run = App.run
 def _capture_run(self, *a, **k):
-    _captured["app"] = self
+    _captured["app"] = self          # remember the instance; do NOT start the loop
 App.run = _capture_run
+if hasattr(App, "async_run"):
+    async def _capture_async_run(self, *a, **k):
+        _captured["app"] = self
+    App.async_run = _capture_async_run
+_real_rta = _kbase.runTouchApp
+def _noop_rta(*a, **k):
+    return None                      # never spin a real mainloop during the self-test
+_kbase.runTouchApp = _noop_rta
 
 ns = {"__name__": "__main__", "__file__": "main.py"}
 try:
     exec(code_obj, ns)
     phase("import", True)
 except SystemExit:
-    phase("import", True, "module called sys.exit")
+    # even if the module bailed with sys.exit, whatever it defined is still in ns
+    phase("import", True, "module called sys.exit (tolerated)")
 except Exception:
     phase("import", False, traceback.format_exc())
     print("DAWG_TEST_FAIL"); os._exit(1)
 
-# find the App: the one .run() captured, else the first App subclass defined
+# Find the App. Prefer the instance .run()/async_run captured; otherwise hunt the namespace
+# for ANY App subclass -- including one named exactly `App` (a very common model mistake:
+# `class App(App):`). We pick the LAST such class defined, which is almost always the real
+# app rather than a helper/base.
+def _is_app_subclass(v):
+    try:
+        return isinstance(v, type) and issubclass(v, App) and v is not App
+    except Exception:
+        return False
+
 app = _captured["app"]
 if app is None:
-    for v in ns.values():
-        if isinstance(v, type) and issubclass(v, App) and v is not App:
-            try:
-                app = v()
-            except Exception:
-                phase("instantiate", False, traceback.format_exc())
-                print("DAWG_TEST_FAIL"); os._exit(1)
-            break
+    candidates = [v for v in ns.values() if _is_app_subclass(v)]
+    # also catch a subclass that shadowed the name `App` itself
+    shadow = ns.get("App")
+    if _is_app_subclass(shadow) and shadow not in candidates:
+        candidates.append(shadow)
+    if candidates:
+        try:
+            app = candidates[-1]()
+        except Exception:
+            phase("instantiate", False, traceback.format_exc())
+            print("DAWG_TEST_FAIL"); os._exit(1)
 if app is None:
-    phase("instantiate", False, "no App subclass found and .run() was never called")
+    phase("instantiate", False,
+          "no App subclass found. Make sure you `class YourApp(App):` and call "
+          "`YourApp().run()` at the bottom under `if __name__ == '__main__':`.")
     print("DAWG_TEST_FAIL"); os._exit(1)
 phase("instantiate", True, type(app).__name__)
 
@@ -2619,6 +2697,14 @@ class H(BaseHTTPRequestHandler):
                 {"id": k, "label": v["label"], "desc": v["desc"], "kit": v.get("kit", True)}
                 for k, v in TEMPLATES.items()
             ]})
+        if path == "/api/devices":
+            devs = []
+            if _devices is not None:
+                for k in _devices.names():
+                    p = _devices.get(k)
+                    devs.append({"id": k, "label": p["label"], "category": p["category"]})
+            return self._send(200, {"devices": devs, "default": getattr(_devices, "DEFAULT", ""),
+                                    "available": _devices is not None and host_has_kivy()})
         if path == "/api/template":
             qs = parse_qs(urlparse(self.path).query)
             tid = (qs.get("id") or [""])[0]
@@ -2714,6 +2800,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_config(body)
         if path == "/api/project_zip":
             return self.handle_project_zip(body)
+        if path == "/api/preview":
+            return self.handle_preview(body)
         if path == "/api/quit":
             self._send(200, {"bye": True})
             threading.Timer(0.4, lambda: os._exit(0)).start()
@@ -2957,6 +3045,41 @@ class H(BaseHTTPRequestHandler):
         threading.Thread(target=run_test, args=(tid, main_py, requirements), daemon=True).start()
         return self._send(200, {"test_id": tid})
 
+    def handle_preview(self, body):
+        """Launch the phone-frame desktop preview of the current app -- a live window sized
+        like a real Android screen, so you SEE it before a 40-minute build. Fire-and-forget:
+        it opens its own window on the user's desktop session."""
+        main_py = body.get("main_py") or ""
+        device = (body.get("device") or (getattr(_devices, "DEFAULT", "") if _devices else "")).strip()
+        if not main_py.strip():
+            return self._send(400, {"error": "nothing to preview yet -- forge or write an app first"})
+        sok, smsg = syntax_check(main_py)
+        if not sok:
+            return self._send(400, {"error": "fix the syntax error before previewing: " + smsg})
+        if not host_has_kivy():
+            return self._send(400, {"error": "the preview needs desktop Kivy. Install it once: "
+                                             "pip install --user kivy  (the APK build itself doesn't need it)."})
+        if not os.path.exists(_PREVIEW_PY):
+            return self._send(400, {"error": "preview.py isn't installed next to apkforge.py -- re-run install.sh."})
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return self._send(400, {"error": "no desktop display detected, so a preview window can't open here."})
+        pdir = os.path.join(PROJECTS, "_preview")
+        os.makedirs(pdir, exist_ok=True)
+        try:
+            with open(os.path.join(pdir, "main.py"), "w") as f:
+                f.write(main_py)
+        except Exception as e:
+            return self._send(500, {"error": "couldn't stage the preview: %s" % e})
+        cmd = [sys.executable, _PREVIEW_PY, os.path.join(pdir, "main.py")]
+        if device:
+            cmd += ["--device", device]
+        try:
+            subprocess.Popen(cmd, cwd=pdir, env=dict(os.environ),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            return self._send(500, {"error": "couldn't launch the preview: %s" % e})
+        return self._send(200, {"started": True, "device": device or "default"})
+
     def _overrides_from(self, body):
         """Re-validate build overrides coming from the client (never trust a raw dict)."""
         ov = body.get("build_overrides") or {}
@@ -2979,11 +3102,16 @@ class H(BaseHTTPRequestHandler):
         overrides, _ = self._overrides_from(body)
         if not main_py.strip():
             return self._send(400, {"error": "no main_py to package"})
-        # render assets into bytes so the zip is build-ready out of the box
+        # render assets into bytes so the zip is build-ready out of the box (prefer the
+        # richer iconsmith, fall back to the built-in generator)
         icon_b = splash_b = None
         try:
-            icon_b = icon_png(title or name, 512)
-            splash_b = presplash_png(title or name, 720)
+            if _iconsmith is not None:
+                icon_b = _iconsmith.icon_png(title or name, 512)
+                splash_b = _iconsmith.presplash_png(title or name, 720)
+            else:
+                icon_b = icon_png(title or name, 512)
+                splash_b = presplash_png(title or name, 720)
         except Exception:
             icon_b = splash_b = None
         pcolor = None
@@ -2999,7 +3127,17 @@ class H(BaseHTTPRequestHandler):
             "Build the APK on a Linux box with the SDK/NDK:\n"
             "  cd %s\n"
             "  buildozer android debug\n\n"
-            "APK lands in bin/.\n" % (title, name)
+            "APK lands in bin/.\n\n"
+            "Preview it first (no build needed), in a phone-shaped desktop window:\n"
+            "  pip install --user kivy      # once\n"
+            "  ./run_preview.sh             # or: python3 ../preview.py %s/main.py\n"
+            % (title, name, name)
+        )
+        run_preview = (
+            "#!/usr/bin/env bash\n"
+            "# Preview this app at real Android-phone size before building the APK.\n"
+            "cd \"$(dirname \"$0\")\"\n"
+            "exec python3 preview.py \"%s/main.py\" --device pixel_8 \"$@\"\n" % name
         )
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -3010,6 +3148,18 @@ class H(BaseHTTPRequestHandler):
                 z.writestr(name + "/icon.png", icon_b)
             if splash_b:
                 z.writestr(name + "/presplash.png", splash_b)
+            # bundle the preview tooling at the zip root so the project previews anywhere
+            for mod in ("preview.py", "devices.py", "iconsmith.py"):
+                p = os.path.join(_HERE, mod)
+                try:
+                    if os.path.exists(p):
+                        with open(p, "r") as mf:
+                            z.writestr(mod, mf.read())
+                except Exception:
+                    pass
+            zi = zipfile.ZipInfo("run_preview.sh")
+            zi.external_attr = 0o755 << 16   # make it executable
+            z.writestr(zi, run_preview)
         data = buf.getvalue()
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
@@ -3441,6 +3591,8 @@ INDEX_HTML = r"""<!doctype html>
 
     <div class="actions">
       <button class="accent" id="buildBtn" onclick="buildApk()">Build APK</button>
+      <button id="previewBtn" onclick="previewApp()" title="open the app in a phone-shaped window on your desktop -- no build needed">&#128241; Preview</button>
+      <select id="previewDevice" title="preview device" style="max-width:180px"></select>
       <button id="testBtn" onclick="testRun()">Self-test</button>
       <button class="warn" id="fixBtn" onclick="autoFix()">Auto-fix</button>
       <button id="repairBtn" onclick="localRepair()" title="deterministic fixes, no API call">Repair free</button>
@@ -3933,6 +4085,37 @@ function pollTest(tid, done){
   }, 700);
 }
 
+/* ---------------------------------------------------------------- preview */
+async function loadDevices(){
+  try{
+    var r=await fetch('/api/devices'); var d=await r.json();
+    var sel=$('previewDevice'); if(!sel) return;
+    sel.innerHTML='';
+    (d.devices||[]).forEach(function(dev){
+      var o=document.createElement('option'); o.value=dev.id; o.textContent=dev.label;
+      if(dev.id===d.default) o.selected=true; sel.appendChild(o);
+    });
+    if(!d.available){
+      var pb=$('previewBtn');
+      if(pb){ pb.disabled=true; pb.title='install desktop Kivy to preview: pip install --user kivy'; }
+    }
+  }catch(e){}
+}
+async function previewApp(){
+  if(!cur) return; collect();
+  if(!(cur.main_py||'').trim()){ toast('nothing to preview yet','warn'); return; }
+  var dev=($('previewDevice')||{}).value||'';
+  var done=busy('previewBtn','opening');
+  try{
+    var r=await fetch('/api/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({main_py:cur.main_py, device:dev})});
+    var d=await r.json();
+    if(!r.ok){ toast(d.error||'preview failed','bad'); }
+    else{ toast('opening preview window…','ok'); }
+  }catch(e){ toast('network: '+e,'bad'); }
+  done();
+}
+
 /* ---------------------------------------------------------------- build */
 async function buildApk(){
   if(!cur) return; collect();
@@ -4154,7 +4337,7 @@ document.addEventListener('keydown', function(e){
   if((e.ctrlKey||e.metaKey)&&e.key==='s'){ e.preventDefault(); if(cur) testRun(); }
 });
 
-loadDoctor(); loadTemplates(); loadUsage(); refreshButtons();
+loadDoctor(); loadTemplates(); loadUsage(); loadDevices(); refreshButtons();
 setInterval(loadUsage, 15000);
 </script>
 </body>

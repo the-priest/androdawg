@@ -183,13 +183,22 @@ echo "[dawg] (optional) installing host Kivy for the self-test..."
   && echo "[dawg]   host Kivy ready -> the self-test will catch launch crashes" \
   || echo "[dawg]   host Kivy not installed (self-test will be skipped; builds still work)"
 
-# 4) fetch app + icon from the local checkout, or GitHub as a fallback
-echo "[dawg] fetching app + icon..."
+# 4) fetch app + sibling modules + icon from the local checkout, or GitHub as a fallback
+echo "[dawg] fetching app + modules + icon..."
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/apkforge.py" ]; then
   cp "$SRC_DIR/apkforge.py" "$APP_DIR/apkforge.py"
 else
   curl -fsSL "$RAW/apkforge.py" -o "$APP_DIR/apkforge.py" || { echo "[dawg] ERROR: could not download apkforge.py"; exit 1; }
 fi
+# sibling modules: preview.py (phone-frame preview), devices.py (screen profiles),
+# iconsmith.py (pro launcher icons). Optional -- the app degrades gracefully without them.
+for MOD in preview.py devices.py iconsmith.py; do
+  if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/$MOD" ]; then
+    cp "$SRC_DIR/$MOD" "$APP_DIR/$MOD"
+  else
+    curl -fsSL "$RAW/$MOD" -o "$APP_DIR/$MOD" || echo "[dawg]   WARN: could not fetch $MOD (preview/icons may be limited)"
+  fi
+done
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/icon.png" ]; then
   cp "$SRC_DIR/icon.png" "$APP_DIR/icon.png"
 else
