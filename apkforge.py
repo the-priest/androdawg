@@ -58,14 +58,6 @@ HOST = "127.0.0.1"
 PORT = 8731
 
 SF_URL = "https://api.siliconflow.cn/v1/chat/completions"
-# SiliconFlow runs two SEPARATE platforms with separate accounts/keys: the China
-# site (siliconflow.cn) and the international site (siliconflow.com). A key minted
-# on one is meaningless on the other's API and comes back as a plain 401 "invalid/
-# expired key" -- indistinguishable from an actually-bad key. If the primary host
-# rejects the key with 401/403, we retry once against this sibling host before
-# giving up, so a .com-issued key still works against the .cn-hardcoded default
-# (and vice versa) without the user having to know this platform split exists.
-SF_URL_ALT = "https://api.siliconflow.com/v1/chat/completions"
 SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -1347,9 +1339,32 @@ def host_has_kivy():
         return False
 
 
+# ------------------------------------------------------------- distro-aware install hints
+def _pkg_manager():
+    """Best-effort detection of the system package manager, for actionable error hints."""
+    for pm in ("pacman", "apt-get", "dnf", "zypper"):
+        if shutil.which(pm):
+            return "apt" if pm == "apt-get" else pm
+    return ""
+
+
+def pkg_hint(pacman="", apt="", dnf="", zypper=""):
+    """Return a copy-pasteable install command for THIS machine's package manager.
+    CachyOS/Arch (pacman) is a first-class citizen; apt/dnf/zypper are covered too."""
+    pm = _pkg_manager()
+    table = {"pacman": pacman, "apt": apt, "dnf": dnf, "zypper": zypper}
+    cmd = table.get(pm) or apt or pacman or ""
+    return cmd
+
+
+# xvfb-run is a Debian wrapper; Arch's xorg-server-xvfb ships only the Xvfb binary. We
+# treat EITHER as usable, and apkforge launches Xvfb itself when the wrapper is absent.
 def host_can_display():
-    """A headless test run needs either a live $DISPLAY or xvfb-run to fake one."""
-    return bool(os.environ.get("DISPLAY")) or shutil.which("xvfb-run") is not None
+    """The self-test needs a display: a live X11 $DISPLAY, or xvfb-run, or a bare Xvfb we
+    can drive ourselves (Arch/CachyOS), or a Wayland session with XWayland's Xvfb fallback."""
+    return bool(os.environ.get("DISPLAY")) \
+        or shutil.which("xvfb-run") is not None \
+        or shutil.which("Xvfb") is not None
 
 
 def host_can_test():
@@ -1614,6 +1629,33 @@ def _post_json(url, key, payload):
         return json.loads(r.read().decode("utf-8"))
 
 
+# A transient hiccup (rate-limit, a 5xx, a dropped connection, a read timeout) shouldn't
+# surface as a hard failure that kills a forge/fix round -- so we retry those a few times
+# with backoff. A PERMANENT error (bad key 401/403, unknown model 404/400) is re-raised
+# immediately: retrying it just wastes time and never succeeds.
+_RETRY_HTTP = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def _post_json_resilient(url, key, payload, tries=3):
+    delay = 1.5
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return _post_json(url, key, payload)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in _RETRY_HTTP or attempt == tries:
+                raise               # permanent, or out of attempts -> let caller report it
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last = e
+            if attempt == tries:
+                raise
+        time.sleep(delay)
+        delay = min(delay * 2, 12)  # 1.5s -> 3s -> 6s ... capped
+    if last:
+        raise last                  # defensive; loop above always returns or raises
+
+
 def est_tokens(text):
     """Cheap token estimate (~4 chars/token) for pre-flight sizing and cache stats."""
     return max(1, len(text or "") // 4)
@@ -1720,41 +1762,27 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
     errs = []
     if sf:
         sf_u = chat_url(CONFIG.get("sf_url") or SF_URL)
-        # Only auto-try the sibling .cn/.com host when the user hasn't explicitly
-        # pointed sf_url at something custom -- don't second-guess a real override.
-        sf_u_alt = chat_url(SF_URL_ALT) if sf_u == chat_url(SF_URL) else \
-                   (chat_url(SF_URL) if sf_u == chat_url(SF_URL_ALT) else None)
-        candidates = [sf_u] + ([sf_u_alt] if sf_u_alt else [])
-        for i, u in enumerate(candidates):
-            try:
-                d = _post_json(u, sf, {
-                    "model": model, "messages": messages,
-                    "temperature": temperature, "max_tokens": max_tokens,
-                })
-                text = d["choices"][0]["message"]["content"]
-                usage = d.get("usage") or {}
-                meter(usage.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
-                      usage.get("completion_tokens") or est_tokens(text))
-                prov = "SiliconFlow / " + model
-                if i > 0:
-                    prov += "  [via %s -- your key wasn't valid on %s, remembered for next time]" % (u, candidates[0])
-                    CONFIG["sf_url"] = u
-                    save_config(CONFIG)
-                cache_put(key, text, prov)
-                return text, prov
-            except urllib.error.HTTPError as e:
-                msg = _provider_error("SiliconFlow", e, model)
-                is_key_reject = e.code in (401, 403) and "allowlist" not in msg.lower() and "egress" not in msg.lower()
-                if is_key_reject and i < len(candidates) - 1:
-                    continue  # try the sibling host before giving up on this key
-                errs.append(msg)
-            except Exception as e:
-                errs.append("SiliconFlow (%s): %s" % (u, e))
+        try:
+            d = _post_json_resilient(sf_u, sf, {
+                "model": model, "messages": messages,
+                "temperature": temperature, "max_tokens": max_tokens,
+            })
+            text = d["choices"][0]["message"]["content"]
+            u = d.get("usage") or {}
+            meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
+                  u.get("completion_tokens") or est_tokens(text))
+            prov = "SiliconFlow / " + model
+            cache_put(key, text, prov)
+            return text, prov
+        except urllib.error.HTTPError as e:
+            errs.append(_provider_error("SiliconFlow", e, model))
+        except Exception as e:
+            errs.append("SiliconFlow (%s): %s" % (sf_u, e))
     if gq:
         gq_u = chat_url(CONFIG.get("groq_url") or GROQ_URL)
         gq_model = CONFIG.get("groq_model") or GROQ_MODEL
         try:
-            d = _post_json(gq_u, gq, {
+            d = _post_json_resilient(gq_u, gq, {
                 "model": gq_model, "messages": messages,
                 "temperature": temperature, "max_tokens": max_tokens,
             })
@@ -2141,6 +2169,51 @@ def _missing_module(text):
     return m.group(1).split(".")[0] if m else None
 
 
+def _start_xvfb():
+    """Start a private Xvfb on the first free display number and return (":N", proc).
+    Used on Arch/CachyOS, whose xorg-server-xvfb ships Xvfb but not the xvfb-run wrapper.
+    Returns (None, None) if it can't come up. Caller must _stop_xvfb(proc) when done."""
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        return None, None
+    for n in range(99, 129):  # high numbers avoid clashing with a real :0/:1
+        if os.path.exists("/tmp/.X%d-lock" % n):
+            continue
+        disp = ":%d" % n
+        try:
+            proc = subprocess.Popen(
+                [xvfb, disp, "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return None, None
+        # give the server a moment; if it died instantly the display number was taken
+        for _ in range(50):
+            if proc.poll() is not None:
+                break
+            if os.path.exists("/tmp/.X%d-lock" % n):
+                return disp, proc
+            time.sleep(0.05)
+        if proc.poll() is None:
+            # came up without a lock file (rare); trust it
+            return disp, proc
+        # died -> try the next number
+    return None, None
+
+
+def _stop_xvfb(proc):
+    if not proc:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    except Exception:
+        pass
+
+
 def run_test(test_id, main_py, requirements):
     rec = TESTS[test_id]
 
@@ -2156,7 +2229,13 @@ def run_test(test_id, main_py, requirements):
         return
     if not host_can_display():
         rec["status"] = "skipped"
-        rec["summary"] = "no display available. Install xvfb to enable headless test runs: sudo apt install -y xvfb"
+        hint = pkg_hint(pacman="sudo pacman -S xorg-server-xvfb",
+                        apt="sudo apt install -y xvfb",
+                        dnf="sudo dnf install -y xorg-x11-server-Xvfb",
+                        zypper="sudo zypper install xorg-x11-server-Xvfb")
+        rec["summary"] = ("no display available for the headless self-test. Install Xvfb to "
+                          "enable it: " + (hint or "install your distro's Xvfb package")) + \
+                         "  (optional -- the APK build doesn't need it)."
         log(rec["summary"])
         return
 
@@ -2173,12 +2252,35 @@ def run_test(test_id, main_py, requirements):
         log(rec["summary"])
         return
 
-    if os.environ.get("DISPLAY"):
+    # Pick how to give the app a display. Order of preference:
+    #   1. xvfb-run  - a clean throwaway virtual display (Debian ships it)
+    #   2. Xvfb      - Arch/CachyOS ship the binary but NOT the wrapper, so we run it
+    #                  ourselves on a free display number and tear it down after.
+    #   3. live $DISPLAY - only if neither of the above exists (last resort; may pop a
+    #                  visible window). On a pure Wayland session with no XWayland this
+    #                  won't be set, which is exactly why the Xvfb path above matters.
+    env = dict(os.environ, KIVY_NO_ARGS="1", KIVY_LOG_LEVEL="warning",
+               PYTHONUNBUFFERED="1", KIVY_NO_CONSOLELOG="0",
+               SDL_AUDIODRIVER="dummy")  # no audio device on a virtual display
+    xvfb_proc = None
+    if shutil.which("xvfb-run"):
+        cmd = ["xvfb-run", "-a", sys.executable, "__dawg_run.py"]
+    elif shutil.which("Xvfb"):
+        disp, xvfb_proc = _start_xvfb()
+        if disp is None:
+            rec["status"] = "skipped"
+            rec["summary"] = "found Xvfb but couldn't start it; self-test skipped (build still works)."
+            log(rec["summary"])
+            return
+        env["DISPLAY"] = disp
+        cmd = [sys.executable, "__dawg_run.py"]
+    elif os.environ.get("DISPLAY"):
         cmd = [sys.executable, "__dawg_run.py"]
     else:
-        cmd = ["xvfb-run", "-a", sys.executable, "__dawg_run.py"]
-    env = dict(os.environ, KIVY_NO_ARGS="1", KIVY_LOG_LEVEL="warning",
-               PYTHONUNBUFFERED="1", KIVY_NO_CONSOLELOG="0")
+        rec["status"] = "skipped"
+        rec["summary"] = "no display and no Xvfb available; self-test skipped (build still works)."
+        log(rec["summary"])
+        return
     log("$ " + " ".join(cmd))
     log("(self-test: compile -> import -> build -> render -> tap every button -> rotate -> 3s soak)")
     log("")
@@ -2201,6 +2303,8 @@ def run_test(test_id, main_py, requirements):
         rec["summary"] = "test run error: %s" % e
         log(rec["summary"])
         return
+    finally:
+        _stop_xvfb(xvfb_proc)
 
     # pull the structured phase report out of the stream
     phases = []
@@ -2507,22 +2611,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/ping":
             return self._send(200, {"app": "androdawg", "version": VERSION, "ok": True})
         if path == "/api/keytest":
-            # A one-token live call so the user can see EXACTLY why the key is or isn't
-            # working -- no guessing between a bad key, a bad model, and a network block.
-            if not sf_key() and not groq_key():
-                return self._send(200, {"ok": False, "stage": "nokey",
-                    "detail": "No API key is set. Paste your SiliconFlow key above and Save first."})
-            was = CONFIG.get("cache")
-            CONFIG["cache"] = False  # never answer a key test from cache
-            try:
-                txt, prov = call_ai([{"role": "user", "content": "ping"}],
-                                    temperature=0, max_tokens=1, label="keytest")
-                return self._send(200, {"ok": True, "provider": prov,
-                    "detail": "Key works. Reached %s and got a reply." % prov})
-            except Exception as e:
-                return self._send(200, {"ok": False, "stage": "call", "detail": str(e)})
-            finally:
-                CONFIG["cache"] = was
+            return self._keytest()
         if path == "/api/doctor":
             return self._send(200, {"checks": doctor(), "can_test": host_can_test()})
         if path == "/api/templates":
@@ -2718,6 +2807,89 @@ class H(BaseHTTPRequestHandler):
                          args=(jid, desc, seed, body.get("rounds")), daemon=True).start()
         return self._send(200, {"job_id": jid})
 
+    def _keytest(self):
+        """Diagnose a key by testing it TWO ways: curl and Python urllib.
+        If curl works but Python doesn't, the bug is in our request construction.
+        If both fail, the key genuinely doesn't work for this endpoint."""
+        key = sf_key()
+        if not key:
+            return self._send(200, {"ok": False, "curl_ok": False, "py_ok": False,
+                "detail": "No API key is set. Paste your SiliconFlow key in the field above and Save first."})
+        model = CONFIG.get("sf_model") or SF_MODEL
+        url = chat_url(CONFIG.get("sf_url") or SF_URL)
+        masked = key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
+        payload = json.dumps({
+            "model": model, "messages": [{"role": "user", "content": "say ok"}],
+            "temperature": 0, "max_tokens": 3,
+        })
+        diag = {"url": url, "model": model, "key_masked": masked,
+                "key_len": len(key), "key_prefix": key[:3]}
+
+        # --- test 1: curl (the ground truth, no Python in the way) ---
+        curl_ok, curl_detail = False, ""
+        try:
+            cmd = [
+                "curl", "-s", "-w", "\n%{http_code}", "-X", "POST", url,
+                "-H", "Content-Type: application/json",
+                "-H", "Authorization: Bearer " + key,
+                "-d", payload,
+                "--max-time", "15",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            parts = proc.stdout.rsplit("\n", 1)
+            body = parts[0] if len(parts) > 1 else proc.stdout
+            code = int(parts[-1]) if len(parts) > 1 and parts[-1].strip().isdigit() else 0
+            if code == 200:
+                curl_ok = True
+                curl_detail = "curl got HTTP 200 -- key works via curl"
+            else:
+                curl_detail = "curl got HTTP %d: %s" % (code, body[:300])
+            diag["curl_http"] = code
+            diag["curl_body"] = body[:400]
+        except Exception as e:
+            curl_detail = "curl failed: %s" % e
+
+        # --- test 2: Python urllib (what call_ai actually uses) ---
+        py_ok, py_detail = False, ""
+        try:
+            req = urllib.request.Request(url, data=payload.encode("utf-8"), headers={
+                "Authorization": "Bearer " + key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": UA,
+            }, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                py_body = r.read().decode("utf-8")
+                py_ok = True
+                py_detail = "Python urllib got HTTP 200 -- key works"
+                diag["py_http"] = r.status
+        except urllib.error.HTTPError as e:
+            try:
+                py_body = e.read().decode("utf-8")[:400]
+            except Exception:
+                py_body = ""
+            py_detail = "Python urllib got HTTP %d: %s" % (e.code, py_body[:300])
+            diag["py_http"] = e.code
+            diag["py_body"] = py_body
+        except Exception as e:
+            py_detail = "Python urllib error: %s" % e
+
+        # --- verdict ---
+        if curl_ok and py_ok:
+            detail = "Key works. Both curl and Python reached %s with model %s." % (url, model)
+        elif curl_ok and not py_ok:
+            detail = ("CURL WORKS but Python fails -- the bug is in the request headers. "
+                      "Curl: %s. Python: %s" % (curl_detail, py_detail))
+        elif not curl_ok and not py_ok:
+            detail = ("Both curl and Python fail -- the key or model is rejected by the server. "
+                      "Curl: %s. Python: %s" % (curl_detail, py_detail))
+        else:
+            detail = "Curl: %s. Python: %s" % (curl_detail, py_detail)
+
+        diag["curl_ok"] = curl_ok
+        diag["py_ok"] = py_ok
+        return self._send(200, {"ok": curl_ok or py_ok, "detail": detail, "diag": diag})
+
     def handle_forge(self, body):
         desc = (body.get("description") or "").strip()
         if not desc:
@@ -2875,11 +3047,16 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": "buildozer not found on PATH. Run install.sh (or `pip install buildozer cython`), then retry."})
         jver, jmaj = java_version()
         if jmaj is not None and not (GRADLE_JDK_MIN <= jmaj <= GRADLE_JDK_MAX):
+            jhint = pkg_hint(pacman="sudo pacman -S jdk17-openjdk",
+                             apt="sudo apt install -y openjdk-17-jdk",
+                             dnf="sudo dnf install -y java-17-openjdk-devel",
+                             zypper="sudo zypper install java-17-openjdk-devel") \
+                    or "install a JDK 17 (must be 17-24, not 25+)"
             return self._send(400, {"error":
-                "Java %s is active, but Buildozer's Gradle needs JDK 17. The build would "
-                "run for ages then die at the Gradle step. Fix: sudo apt install -y "
-                "openjdk-17-jdk  then relaunch The Dawg (it uses JDK 17 automatically once "
-                "installed)." % jver})
+                "Java %s is active, but Buildozer's Gradle needs JDK 17-24. The build would "
+                "run for ages then die at the Gradle step. Fix: %s  then relaunch The Dawg "
+                "(it points JAVA_HOME at a compatible JDK automatically once one is "
+                "installed)." % (jver, jhint)})
         project_dir = os.path.join(PROJECTS, name)
         os.makedirs(project_dir, exist_ok=True)
         if body.get("clean"):
@@ -3152,98 +3329,13 @@ INDEX_HTML = r"""<!doctype html>
     display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .empty{text-align:center;padding:44px 20px;color:var(--dim)}
   .empty .big{font-size:38px;opacity:.35;margin-bottom:10px}
-
-  /* =====================================================================
-     POLISH PASS -- purely additive/overriding visual layer. No selector
-     here changes an id/class the JS depends on; this only makes the
-     existing structure look sharper (motion, depth, glow, gradients).
-     ===================================================================== */
-
-  /* ambient animated mesh behind everything, fixed so it doesn't affect layout/scroll math */
-  body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
-    background:
-      radial-gradient(900px 520px at 82% -8%, rgba(67,200,245,.14), transparent 60%),
-      radial-gradient(760px 480px at 4% 0%, rgba(139,124,246,.12), transparent 58%),
-      radial-gradient(680px 520px at 60% 108%, rgba(61,220,132,.07), transparent 60%);
-    background-size:180% 180%,180% 180%,180% 180%;
-    animation:meshdrift 26s ease-in-out infinite alternate}
-  @keyframes meshdrift{
-    0%{background-position:0% 0%,100% 0%,50% 100%}
-    100%{background-position:12% 14%,88% 10%,44% 92%}
-  }
-  /* faint grain so flat dark panels don't look plasticky */
-  body::after{content:"";position:fixed;inset:0;z-index:90;pointer-events:none;opacity:.035;mix-blend-mode:overlay;
-    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>")}
-
-  header{box-shadow:0 1px 0 rgba(255,255,255,.03) inset}
-  header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
-    background:linear-gradient(90deg,transparent,var(--cyan),var(--violet),var(--green),transparent);
-    background-size:300% 100%;opacity:.55;animation:hbar 9s linear infinite}
-  @keyframes hbar{0%{background-position:0% 0%}100%{background-position:300% 0%}}
-
-  .logo{position:relative;box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55),
-      0 0 22px -4px rgba(139,124,246,.55);
-    animation:logoglow 3.2s ease-in-out infinite}
-  @keyframes logoglow{
-    0%,100%{box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55),0 0 16px -4px rgba(139,124,246,.45)}
-    50%{box-shadow:0 0 0 1px rgba(139,124,246,.45),0 8px 24px -6px rgba(139,124,246,.75),0 0 26px -2px rgba(67,200,245,.65)}
-  }
-  .brandtxt{background:linear-gradient(90deg,var(--txt) 0%,var(--cyan) 22%,var(--violet) 44%,var(--txt) 66%,var(--cyan) 88%,var(--txt) 100%);
-    background-size:260% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
-    animation:shimmer 7s linear infinite}
-  @keyframes shimmer{0%{background-position:0% 0%}100%{background-position:260% 0%}}
-
-  .panel{position:relative;isolation:isolate;transition:box-shadow .25s ease,border-color .25s ease,transform .25s ease;
-    animation:panelin .32s cubic-bezier(.2,.8,.2,1)}
-  @keyframes panelin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-  .panel::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;z-index:-1;
-    background:linear-gradient(160deg,rgba(67,200,245,.28),rgba(139,124,246,.14) 35%,transparent 60%);
-    -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-    -webkit-mask-composite:xor;mask-composite:exclude;opacity:.55;pointer-events:none}
-  .panel:hover{box-shadow:var(--sh),0 0 0 1px rgba(67,200,245,.08)}
-
-  .tabs{position:relative;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}
-  .tab{position:relative}
-  .tab.active{box-shadow:0 4px 18px -6px rgba(67,200,245,.85),0 0 0 1px rgba(255,255,255,.06) inset}
-
-  button.primary,button.accent,button.violet{position:relative;overflow:hidden}
-  button.primary::before,button.accent::before,button.violet::before{
-    content:"";position:absolute;top:0;left:-60%;width:40%;height:100%;
-    background:linear-gradient(115deg,transparent,rgba(255,255,255,.5),transparent);
-    transform:skewX(-18deg);transition:left .55s ease}
-  button.primary:hover:not(:disabled)::before,button.accent:hover:not(:disabled)::before,
-  button.violet:hover:not(:disabled)::before{left:130%}
-  button.primary:hover:not(:disabled),button.accent:hover:not(:disabled),button.violet:hover:not(:disabled){
-    transform:translateY(-1.5px) scale(1.012)}
-  button:active:not(:disabled){transform:translateY(0) scale(.985) !important}
-
-  .pill.ok .dot{animation:dotpulse 1.7s ease-in-out infinite}
-  @keyframes dotpulse{0%,100%{box-shadow:0 0 4px currentColor}50%{box-shadow:0 0 12px currentColor}}
-  .pill{transition:border-color .18s,transform .18s}
-  .chip:hover:not(:disabled){transform:translateY(-1px)}
-
-  .bar i{background:linear-gradient(90deg,var(--cyan),var(--violet),var(--green),var(--cyan));
-    background-size:300% 100%;animation:sl 1.1s ease-in-out infinite,barhue 3.6s linear infinite}
-  @keyframes barhue{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(30deg)}}
-
-  .modal{animation:modalin .22s cubic-bezier(.2,.8,.2,1)}
-  @keyframes modalin{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
-  .overlay{animation:ovin .18s ease-out}
-  @keyframes ovin{from{opacity:0}to{opacity:1}}
-
-  ::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#233247,#1a2635)}
-  ::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#345070,#243549)}
-
-  @media (prefers-reduced-motion: reduce){
-    body::before,.logo,.brandtxt,header::after,.bar i,.panel,.pill.ok .dot{animation:none !important}
-  }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">
     <div class="logo">D</div>
-    <span><b class="brandtxt">THE DAWG</b> <em>// APK FORGE</em></span>
+    <span>THE DAWG <em>// APK FORGE</em></span>
     <span class="ver">v3.0</span>
   </div>
   <span class="grow"></span>
@@ -3984,17 +4076,25 @@ function closeSettings(){ hide('settings'); }
 function overlayClick(e){ if(e.target && e.target.id==='settings') closeSettings(); }
 
 async function testKey(){
-  // save whatever's typed first, so we test what the user is actually looking at
   await saveSettings(true);
   var done=busy('keytestBtn','testing');
-  $('setmsg').textContent='';
+  $('setmsg').textContent='testing key via curl + Python...';
   try{
     var r=await fetch('/api/keytest',{method:'POST'});
     var d=await r.json();
-    $('setmsg').innerHTML = d.ok
-      ? '<span style="color:var(--green)">\u2713 '+esc(d.detail)+'</span>'
-      : '<span style="color:var(--danger)">\u2717 '+esc(d.detail)+'</span>';
-    toast(d.ok?'key works':'key test failed', d.ok?'ok':'bad');
+    var di=d.diag||{};
+    var lines=[];
+    lines.push(d.ok?'\u2713 '+d.detail:'\u2717 '+d.detail);
+    if(di.url) lines.push('URL: '+di.url);
+    if(di.model) lines.push('Model: '+di.model);
+    if(di.key_masked) lines.push('Key: '+di.key_masked+' ('+di.key_len+' chars, starts with '+di.key_prefix+')');
+    if(di.curl_http) lines.push('curl HTTP: '+di.curl_http);
+    if(di.py_http) lines.push('Python HTTP: '+di.py_http);
+    if(!d.ok && di.curl_body) lines.push('Server said: '+di.curl_body.slice(0,200));
+    if(!d.ok && di.py_body && !di.curl_body) lines.push('Server said: '+di.py_body.slice(0,200));
+    $('setmsg').innerHTML='<pre style="white-space:pre-wrap;font-size:12px;color:'+(d.ok?'var(--green)':'var(--danger)')
+      +';margin:8px 0 0;max-height:200px;overflow:auto">'+esc(lines.join('\n'))+'</pre>';
+    toast(d.ok?'key works':'key test failed -- see details below', d.ok?'ok':'bad');
     loadDoctor();
   }catch(e){ $('setmsg').textContent='error: '+e; }
   finally{ done(); }
@@ -4202,17 +4302,27 @@ def main():
     if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
         os.environ["PATH"] = local_bin + os.pathsep + os.environ.get("PATH", "")
     os.environ.setdefault("PIP_BREAK_SYSTEM_PACKAGES", "1")
-    # Force JDK 17 for the build if one is installed. Buildozer's bundled Gradle can't
-    # run on JDK 25+ (Kali's default), so we point JAVA_HOME at 17 regardless of the
-    # system default. If no 17 is present, the doctor + preflight will flag it.
-    for pat in ("/usr/lib/jvm/temurin-17-jdk*", "/usr/lib/jvm/java-17-openjdk*",
-                "/usr/lib/jvm/*-17-*", "/usr/lib/jvm/*17*"):
-        hits = sorted(p for p in glob.glob(pat)
-                      if os.path.isdir(p) and os.path.exists(os.path.join(p, "bin", "java")))
-        if hits:
-            os.environ["JAVA_HOME"] = hits[0]
-            os.environ["PATH"] = os.path.join(hits[0], "bin") + os.pathsep + os.environ.get("PATH", "")
-            break
+    # Pin a Gradle-compatible JDK for the build. Buildozer's bundled Gradle runs on
+    # JDK 17-24 but dies on 25+ (class file major 69) -- and 25+ is now the default on
+    # both Kali and up-to-date Arch/CachyOS (jdk-openjdk). If the active java is already
+    # in range we leave it; otherwise we hunt for one and point JAVA_HOME at it. 17 is
+    # preferred; 18-24 are accepted fallbacks. If none exists, doctor + preflight flag it.
+    _jver, _jmaj = java_version()
+    if _jmaj is None or not (GRADLE_JDK_MIN <= _jmaj <= GRADLE_JDK_MAX):
+        _patterns = (
+            "/usr/lib/jvm/java-17-openjdk*", "/usr/lib/jvm/temurin-17-jdk*",
+            "/usr/lib/jvm/*-17-*", "/usr/lib/jvm/*17*",           # 17 first (safest)
+            "/usr/lib/jvm/java-1[89]-openjdk*", "/usr/lib/jvm/java-2[0-4]-openjdk*",
+            "/usr/lib/jvm/temurin-1[89]-jdk*", "/usr/lib/jvm/temurin-2[0-4]-jdk*",
+            "/usr/lib/jvm/*-1[89]-*", "/usr/lib/jvm/*-2[0-4]-*",  # then 18-24
+        )
+        for pat in _patterns:
+            hits = sorted(p for p in glob.glob(pat)
+                          if os.path.isdir(p) and os.path.exists(os.path.join(p, "bin", "java")))
+            if hits:
+                os.environ["JAVA_HOME"] = hits[0]
+                os.environ["PATH"] = os.path.join(hits[0], "bin") + os.pathsep + os.environ.get("PATH", "")
+                break
     os.makedirs(PROJECTS, exist_ok=True)
     # single instance + auto-replace: if an instance is running, focus it when it's
     # the same version, or tell it to quit and take over when it's older.

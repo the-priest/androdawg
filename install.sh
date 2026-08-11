@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# THE DAWG // APK FORGE v3 - one-shot installer
-# Wipes any old install, pulls everything from GitHub, installs all deps + JDK 17.
-# v3 adds: generated kit-API contract (no more phantom Theme attrs), zero-token local
-#          repair, kit-stripped AI calls + token metering/budget, an 8-phase self-test
-#          that taps every button, the forge-and-verify agent loop, and a rebuilt UI.
-# v2 added: manual mode, AI custom buildozer.spec, headless test-run, auto-fix/polish,
-# pro icon + presplash, and an own-icon app window (no more "looks like a Brave tab").
-# Run:  curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
+# THE DAWG // APK FORGE v3.1 - one-shot installer
+# Wipes any old install, pulls everything, installs all deps + a Gradle-compatible JDK 17.
+#
+# v3.1 - CACHYOS / ARCH FIRST:
+#   - auto-detects the package manager: pacman (CachyOS/Arch/Manjaro/EndeavourOS) is the
+#     primary path; apt (Debian/Kali/Ubuntu) is kept as a fallback so this still runs there.
+#   - on Arch it installs jdk17-openjdk straight from the official repos (no Temurin repo
+#     dance) and xorg-server-xvfb for the headless self-test.
+#   - because Arch's xvfb package ships Xvfb but NOT the xvfb-run wrapper, apkforge.py now
+#     launches Xvfb itself, so the self-test works on CachyOS (incl. Wayland/KDE) regardless.
+# v3 added: generated kit-API contract, zero-token local repair, kit-stripped AI calls +
+#           token metering/budget, a self-test that taps every button, the forge-and-verify
+#           agent loop, and a rebuilt UI.
+# Run (from the repo folder):  bash install.sh
+#  or:  curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
 set -u
 
 # ---- change this if your repo name differs --------------------------------
@@ -27,7 +34,24 @@ else
   SRC_DIR=""
 fi
 
-echo "[dawg] ===== The Dawg // APK Forge v3 installer ====="
+echo "[dawg] ===== The Dawg // APK Forge v3.1 installer ====="
+
+# ---------------------------------------------------------------------------
+# 0) detect the package manager. pacman (CachyOS/Arch) is preferred; apt is the
+#    Debian/Kali fallback; dnf/zypper are best-effort. PM stays empty if none match.
+# ---------------------------------------------------------------------------
+PM=""
+if   command -v pacman  >/dev/null 2>&1; then PM="pacman"
+elif command -v apt-get >/dev/null 2>&1; then PM="apt"
+elif command -v dnf     >/dev/null 2>&1; then PM="dnf"
+elif command -v zypper  >/dev/null 2>&1; then PM="zypper"
+fi
+# only use sudo if we're not already root and sudo exists
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+fi
+echo "[dawg] package manager: ${PM:-none detected}   sudo: ${SUDO:-none}"
 
 # 1) clean old install (keep saved API keys), then recreate
 echo "[dawg] removing old install (keeping your saved settings)..."
@@ -44,79 +68,122 @@ if [ -f "/tmp/androdawg_config.bak" ]; then
   echo "[dawg] restored your saved keys/settings"
 fi
 
-# 2) system build deps (per-package so one bad name can't sink the batch)
-# xvfb is added so the headless test-run can launch your app on a virtual display
-# and catch launch crashes in ~3s instead of after a 40-min Android build.
-SYS="git zip unzip python3 python3-pip python3-venv autoconf libtool pkg-config \
+# ---------------------------------------------------------------------------
+# 2) system build deps + JDK 17, per package manager.
+#    installed one-by-one so a single bad/renamed package can't sink the batch.
+# ---------------------------------------------------------------------------
+jdk17_present() {
+  for d in /usr/lib/jvm/java-17-openjdk* /usr/lib/jvm/temurin-17-jdk* \
+           /usr/lib/jvm/*-17-* /usr/lib/jvm/*17*; do
+    [ -x "$d/bin/java" ] && return 0
+  done
+  return 1
+}
+
+case "$PM" in
+  # ------------------------------------------------ CachyOS / Arch / Manjaro / Endeavour
+  pacman)
+    # CachyOS ships pip as an externally-managed env, and Xvfb (not xvfb-run) via
+    # xorg-server-xvfb. base-devel is the group that carries gcc/make/pkgconf/autoconf.
+    PKGS="git zip unzip python python-pip base-devel autoconf libtool pkgconf \
+zlib ncurses cmake libffi openssl ccache wget gnupg ca-certificates \
+xorg-server-xvfb jdk17-openjdk"
+    echo "[dawg] syncing pacman databases..."
+    $SUDO pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    echo "[dawg] installing system deps via pacman..."
+    for p in $PKGS; do
+      $SUDO pacman -S --needed --noconfirm "$p" >/dev/null 2>&1 || echo "[dawg]   WARN: $p"
+    done
+    if ! jdk17_present; then
+      echo "[dawg] jdk17-openjdk didn't land; retrying explicitly..."
+      $SUDO pacman -S --needed --noconfirm jdk17-openjdk >/dev/null 2>&1 || true
+    fi
+    ;;
+
+  # ------------------------------------------------ Debian / Kali / Ubuntu
+  apt)
+    SYS="git zip unzip python3 python3-pip python3-venv autoconf libtool pkg-config \
 zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache \
 wget gnupg ca-certificates apt-transport-https xvfb"
-if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
-  echo "[dawg] installing system deps (sudo)..."
-  sudo apt-get update -y || true
-  for p in $SYS; do sudo apt-get install -y "$p" >/dev/null 2>&1 || echo "[dawg]   WARN: $p"; done
+    echo "[dawg] installing system deps (apt)..."
+    $SUDO apt-get update -y || true
+    for p in $SYS; do $SUDO apt-get install -y "$p" >/dev/null 2>&1 || echo "[dawg]   WARN: $p"; done
 
-  # 2b) JDK 17 — REQUIRED. Kali ships no openjdk-17, and its default JDK (21/25) breaks
-  # buildozer's bundled Gradle ("Unsupported class file major version"). Get Temurin 17
-  # by apt, else by tarball. Always lands in /usr/lib/jvm so the app auto-detects it.
-  jdk17_present() { for d in /usr/lib/jvm/temurin-17-jdk* /usr/lib/jvm/java-17-openjdk*; do [ -x "$d/bin/java" ] && return 0; done; return 1; }
-  # heal any broken adoptium repo a previous run may have written (wrong suite -> 404)
-  sudo rm -f /etc/apt/sources.list.d/adoptium.list /etc/apt/keyrings/adoptium.gpg 2>/dev/null || true
-  if jdk17_present; then
-    echo "[dawg] JDK 17 already installed"
-  else
-    echo "[dawg] trying Debian openjdk-17 (usually absent on Kali)..."
-    sudo apt-get install -y openjdk-17-jdk >/dev/null 2>&1 || true
-  fi
-  if ! jdk17_present; then
-    echo "[dawg] installing Temurin 17 via apt..."
-    sudo install -d -m 0755 /etc/apt/keyrings 2>/dev/null || true
-    wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public 2>/dev/null \
-      | sudo gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg 2>/dev/null || true
-    # Adoptium publishes no 'kali-rolling' suite; bookworm debs are self-contained and work on Kali.
-    echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
-      | sudo tee /etc/apt/sources.list.d/adoptium.list >/dev/null 2>&1 || true
-    sudo apt-get update -y >/dev/null 2>&1 || true
-    sudo apt-get install -y temurin-17-jdk >/dev/null 2>&1 || true
-  fi
-  if ! jdk17_present; then
-    echo "[dawg] apt route failed, fetching Temurin 17 tarball (no repo needed)..."
-    sudo rm -f /etc/apt/sources.list.d/adoptium.list 2>/dev/null || true  # don't leave a broken repo
-    sudo apt-get update -y >/dev/null 2>&1 || true
-    sudo mkdir -p /usr/lib/jvm/temurin-17-jdk-amd64
-    if wget -qO /tmp/dawg-jdk17.tgz "https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jdk/hotspot/normal/eclipse"; then
-      sudo tar -xzf /tmp/dawg-jdk17.tgz -C /usr/lib/jvm/temurin-17-jdk-amd64 --strip-components=1 2>/dev/null || true
-      rm -f /tmp/dawg-jdk17.tgz
+    # JDK 17 - Kali ships no openjdk-17, and its default JDK (21/25) breaks buildozer's
+    # bundled Gradle. Try Debian openjdk-17, then Temurin apt repo, then a tarball.
+    $SUDO rm -f /etc/apt/sources.list.d/adoptium.list /etc/apt/keyrings/adoptium.gpg 2>/dev/null || true
+    if ! jdk17_present; then
+      echo "[dawg] trying openjdk-17..."
+      $SUDO apt-get install -y openjdk-17-jdk >/dev/null 2>&1 || true
     fi
-  fi
-  if ! jdk17_present; then
-    echo "[dawg]   WARN: could not install JDK 17 automatically."
-  fi
-else
-  echo "[dawg] no apt/sudo - install build deps + a JDK 17 yourself"
-fi
+    if ! jdk17_present; then
+      echo "[dawg] installing Temurin 17 via apt..."
+      $SUDO install -d -m 0755 /etc/apt/keyrings 2>/dev/null || true
+      wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public 2>/dev/null \
+        | $SUDO gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg 2>/dev/null || true
+      echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" \
+        | $SUDO tee /etc/apt/sources.list.d/adoptium.list >/dev/null 2>&1 || true
+      $SUDO apt-get update -y >/dev/null 2>&1 || true
+      $SUDO apt-get install -y temurin-17-jdk >/dev/null 2>&1 || true
+    fi
+    if ! jdk17_present; then
+      echo "[dawg] apt route failed, fetching Temurin 17 tarball..."
+      $SUDO rm -f /etc/apt/sources.list.d/adoptium.list 2>/dev/null || true
+      $SUDO apt-get update -y >/dev/null 2>&1 || true
+      $SUDO mkdir -p /usr/lib/jvm/temurin-17-jdk-amd64
+      if wget -qO /tmp/dawg-jdk17.tgz "https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jdk/hotspot/normal/eclipse"; then
+        $SUDO tar -xzf /tmp/dawg-jdk17.tgz -C /usr/lib/jvm/temurin-17-jdk-amd64 --strip-components=1 2>/dev/null || true
+        rm -f /tmp/dawg-jdk17.tgz
+      fi
+    fi
+    ;;
 
-# locate JDK 17 (used to pin JAVA_HOME in the launcher)
+  # ------------------------------------------------ Fedora / RHEL
+  dnf)
+    PKGS="git zip unzip python3 python3-pip autoconf libtool pkgconf-pkg-config \
+zlib-devel ncurses-devel cmake libffi-devel openssl-devel @development-tools ccache \
+wget gnupg2 ca-certificates xorg-x11-server-Xvfb java-17-openjdk-devel"
+    echo "[dawg] installing system deps (dnf)..."
+    for p in $PKGS; do $SUDO dnf install -y "$p" >/dev/null 2>&1 || echo "[dawg]   WARN: $p"; done
+    ;;
+
+  # ------------------------------------------------ openSUSE
+  zypper)
+    PKGS="git zip unzip python3 python3-pip autoconf libtool pkg-config \
+zlib-devel ncurses-devel cmake libffi-devel libopenssl-devel gcc gcc-c++ make ccache \
+wget gpg2 ca-certificates xorg-x11-server-Xvfb java-17-openjdk-devel"
+    echo "[dawg] installing system deps (zypper)..."
+    for p in $PKGS; do $SUDO zypper --non-interactive install "$p" >/dev/null 2>&1 || echo "[dawg]   WARN: $p"; done
+    ;;
+
+  *)
+    echo "[dawg] no supported package manager found - install these yourself:"
+    echo "[dawg]   git zip unzip python3 python3-pip a C toolchain, cmake, libffi, openssl,"
+    echo "[dawg]   ccache, Xvfb, and a JDK 17 (must be 17-24; NOT 25+)."
+    ;;
+esac
+
+# locate a Gradle-compatible JDK (17 preferred) to pin JAVA_HOME in the launcher
 JAVA17=""
-for d in /usr/lib/jvm/temurin-17-jdk* /usr/lib/jvm/java-17-openjdk*; do
-  [ -d "$d" ] && JAVA17="$d" && break
+for d in /usr/lib/jvm/java-17-openjdk* /usr/lib/jvm/temurin-17-jdk* \
+         /usr/lib/jvm/*-17-* /usr/lib/jvm/*17*; do
+  [ -x "$d/bin/java" ] && JAVA17="$d" && break
 done
 
 # 3) buildozer + cython into the USER site (NOT a venv: p4a does `pip install --user`)
 echo "[dawg] installing buildozer + cython..."
-python3 -m pip install --user --break-system-packages --upgrade pip wheel >/dev/null 2>&1 || true
-python3 -m pip install --user --break-system-packages "cython==0.29.36" buildozer \
+PYBIN="$(command -v python3 || command -v python)"
+"$PYBIN" -m pip install --user --break-system-packages --upgrade pip wheel >/dev/null 2>&1 || true
+"$PYBIN" -m pip install --user --break-system-packages "cython==0.29.36" buildozer \
   || echo "[dawg]   ERROR: buildozer pip install failed"
 
-# 3b) host Kivy for the headless test-run (OPTIONAL — never fails the install).
-# If it installs, pressing TEST RUN will actually launch your app on a virtual
-# display and tell you if it crashes on start. If it's absent, test-run just
-# reports "skipped" and the build still works fine.
-echo "[dawg] (optional) installing host Kivy for test-run..."
-python3 -m pip install --user --break-system-packages "kivy" >/dev/null 2>&1 \
-  && echo "[dawg]   host Kivy ready -> TEST RUN will catch launch crashes" \
-  || echo "[dawg]   host Kivy not installed (test-run will be skipped; builds still work)"
+# 3b) host Kivy for the headless self-test (OPTIONAL - never fails the install).
+echo "[dawg] (optional) installing host Kivy for the self-test..."
+"$PYBIN" -m pip install --user --break-system-packages "kivy" >/dev/null 2>&1 \
+  && echo "[dawg]   host Kivy ready -> the self-test will catch launch crashes" \
+  || echo "[dawg]   host Kivy not installed (self-test will be skipped; builds still work)"
 
-# 4) fetch app + icon from GitHub (or local checkout)
+# 4) fetch app + icon from the local checkout, or GitHub as a fallback
 echo "[dawg] fetching app + icon..."
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/apkforge.py" ]; then
   cp "$SRC_DIR/apkforge.py" "$APP_DIR/apkforge.py"
@@ -138,14 +205,13 @@ fi
   fi
   echo 'export PATH="$HOME/.local/bin:$PATH"'
   echo 'export PIP_BREAK_SYSTEM_PACKAGES=1'
-  echo "exec python3 \"$APP_DIR/apkforge.py\" \"\$@\""
+  echo "exec \"$PYBIN\" \"$APP_DIR/apkforge.py\" \"\$@\""
 } > "$BIN/androdawg"
 chmod +x "$BIN/androdawg"
 
 # 6) icon + desktop entry
-# StartupWMClass MUST equal the --class apkforge.py passes to the browser window.
-# That binding is what makes KDE/GNOME show THE DAWG's icon + name in the panel
-# (its own taskbar entry) instead of folding the window into Brave/Chromium.
+# StartupWMClass MUST equal the --class apkforge.py passes to the browser window so the
+# panel shows THE DAWG's own icon/name instead of folding it into Brave/Chromium.
 [ -f "$APP_DIR/icon.png" ] && cp "$APP_DIR/icon.png" "$HIC/androdawg.png" 2>/dev/null || true
 cat > "$APPS/androdawg.desktop" <<EOF
 [Desktop Entry]
@@ -172,8 +238,15 @@ if [ -n "$JAVA17" ]; then
   echo "[dawg] JDK 17 -> $JAVA17"
   "$JAVA17/bin/java" -version 2>&1 | head -n1 | sed 's/^/[dawg]   /'
 else
-  echo "[dawg] !!! WARNING: no JDK 17 found. The APK build will reach the Gradle step"
-  echo "[dawg] !!! and FAIL on a newer JDK. Install it:  sudo apt install -y openjdk-17-jdk"
+  echo "[dawg] !!! WARNING: no JDK 17 found. The APK build will reach the Gradle step and"
+  echo "[dawg] !!! FAIL on a newer JDK. Install it:"
+  case "$PM" in
+    pacman) echo "[dawg] !!!   sudo pacman -S jdk17-openjdk" ;;
+    apt)    echo "[dawg] !!!   sudo apt install -y openjdk-17-jdk" ;;
+    dnf)    echo "[dawg] !!!   sudo dnf install -y java-17-openjdk-devel" ;;
+    zypper) echo "[dawg] !!!   sudo zypper install java-17-openjdk-devel" ;;
+    *)      echo "[dawg] !!!   install a JDK 17 (must be 17-24, not 25+)" ;;
+  esac
 fi
 case ":$PATH:" in *":$BIN:"*) : ;; *) echo "[dawg] add to PATH:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
 echo "[dawg] Launch 'The Dawg APK Forge' from your menu, or run:  androdawg"
