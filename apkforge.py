@@ -1805,14 +1805,18 @@ def _provider_error(name, e, model):
     return "%s HTTP %s: %s" % (name, code, detail or raw[:200])
 
 
-def call_ai(messages, temperature=0.4, max_tokens=None, label="call"):
-    """One metered, cached, budget-guarded model call."""
+def call_ai(messages, temperature=0.4, max_tokens=None, label="call", no_cache=False):
+    """One metered, cached, budget-guarded model call.
+
+    no_cache=True skips the cache READ. Without it, clicking Auto-fix twice on the same
+    code + same error replays the identical cached answer forever, so the app never
+    changes and the button looks broken."""
     check_budget()
     model = CONFIG.get("sf_model") or SF_MODEL
     if max_tokens is None:
         max_tokens = int(CONFIG.get("max_tokens") or 12000)
     key = _cache_key(messages, model, max_tokens)
-    hit = cache_get(key)
+    hit = None if no_cache else cache_get(key)
     if hit and hit[0]:
         saved = sum(est_tokens(m.get("content")) for m in messages) + est_tokens(hit[0])
         meter(0, 0, cached=True, saved=saved)
@@ -1904,16 +1908,25 @@ def _finish_ai(payload, provider, requirements, permissions):
     return payload
 
 
-def ai_fix(main_py, error, requirements, permissions):
-    """Fix a fault. Sends APP CODE ONLY -- the 300-line kit never crosses the wire."""
+def ai_fix(main_py, error, requirements, permissions, attempt=0):
+    """Fix a fault. Sends APP CODE ONLY -- the 300-line kit never crosses the wire.
+
+    `attempt` > 0 means the user is asking again because the last fix changed nothing:
+    skip the response cache and loosen the temperature a little, otherwise the same
+    cached answer comes back and Auto-fix appears to do nothing."""
     app = strip_kit(main_py or "")
     msg = ("ERROR / FINDINGS:\n" + (error or "(none given)")
            + "\n\nDECLARED requirements: " + (requirements or "python3,kivy")
            + "\nDECLARED permissions: " + (permissions or "(none)")
            + "\n\nAPP CODE (the kit sits above this, unchanged and in scope):\n" + app)
+    if attempt:
+        msg += ("\n\nNOTE: a previous fix attempt returned code that did not change. Do "
+                "NOT repeat it. Re-read the error above, find the ACTUAL line it names, "
+                "and change that.")
     messages = [{"role": "system", "content": FIX_PROMPT}, {"role": "user", "content": msg}]
     # low temperature: a fix should be a fix, not a creative rewrite
-    text, provider = call_ai(messages, temperature=0.15, label="fix")
+    text, provider = call_ai(messages, temperature=0.15 + min(0.3, 0.15 * attempt),
+                             label="fix", no_cache=bool(attempt))
     payload = build_forge_payload(text, "fix")
     return _finish_ai(payload, provider, requirements, permissions)
 
@@ -2080,12 +2093,15 @@ def _noop_rta(*a, **k):
 _kbase.runTouchApp = _noop_rta
 
 ns = {"__name__": "__main__", "__file__": "main.py"}
+_exit_tb = None
 try:
     exec(code_obj, ns)
-    phase("import", True)
 except SystemExit:
-    # even if the module bailed with sys.exit, whatever it defined is still in ns
-    phase("import", True, "module called sys.exit (tolerated)")
+    # Do NOT call this a pass yet. sys.exit()/SystemExit during import means the module
+    # stopped running where it was raised -- anything below that line, very much including
+    # the App class, was never defined. Whether that is fatal is decided once we know if an
+    # App actually made it into the namespace.
+    _exit_tb = traceback.format_exc()
 except Exception:
     phase("import", False, traceback.format_exc())
     print("DAWG_TEST_FAIL"); os._exit(1)
@@ -2100,19 +2116,32 @@ def _is_app_subclass(v):
     except Exception:
         return False
 
+_candidates = [v for v in ns.values() if _is_app_subclass(v)]
+_shadow = ns.get("App")
+if _is_app_subclass(_shadow) and _shadow not in _candidates:
+    _candidates.append(_shadow)   # a subclass that shadowed the name `App` itself
+
+if _exit_tb is not None:
+    if _captured["app"] is not None or _candidates:
+        # exited after the app was defined -- odd, but survivable
+        phase("import", True, "module called sys.exit after defining the app (tolerated)")
+    else:
+        # This is the real fault. Reporting it as "no App subclass found" sent Auto-fix
+        # chasing a class the app already had, so the model kept returning the same code.
+        phase("import", False,
+              "the module raised SystemExit while being imported, so it stopped before "
+              "defining the app. Nothing below that line ran. Real cause:\n" + _exit_tb)
+        print("DAWG_TEST_FAIL"); os._exit(1)
+else:
+    phase("import", True)
+
 app = _captured["app"]
-if app is None:
-    candidates = [v for v in ns.values() if _is_app_subclass(v)]
-    # also catch a subclass that shadowed the name `App` itself
-    shadow = ns.get("App")
-    if _is_app_subclass(shadow) and shadow not in candidates:
-        candidates.append(shadow)
-    if candidates:
-        try:
-            app = candidates[-1]()
-        except Exception:
-            phase("instantiate", False, traceback.format_exc())
-            print("DAWG_TEST_FAIL"); os._exit(1)
+if app is None and _candidates:
+    try:
+        app = _candidates[-1]()
+    except Exception:
+        phase("instantiate", False, traceback.format_exc())
+        print("DAWG_TEST_FAIL"); os._exit(1)
 if app is None:
     phase("instantiate", False,
           "no App subclass found. Make sure you `class YourApp(App):` and call "
@@ -3027,9 +3056,21 @@ class H(BaseHTTPRequestHandler):
             issues = analyze_code(main_py, reqs, body.get("permissions", ""))
             error = "\n".join("- " + it["msg"] for it in issues) or "no explicit error; review for robustness"
         try:
-            payload = ai_fix(main_py, error, body.get("requirements", ""), body.get("permissions", ""))
+            attempt = int(body.get("attempt") or 0)
+        except Exception:
+            attempt = 0
+        try:
+            payload = ai_fix(main_py, error, body.get("requirements", ""),
+                             body.get("permissions", ""), attempt=attempt)
         except Exception as e:
             return self._send(502, {"error": str(e)})
+        # Tell the client whether anything actually changed. Claiming "fix applied" when
+        # the model handed back byte-identical code is how Auto-fix earned its reputation.
+        try:
+            payload["unchanged"] = (strip_kit(payload.get("main_py") or "").strip()
+                                    == strip_kit(main_py).strip())
+        except Exception:
+            payload["unchanged"] = False
         return self._send(200, payload)
 
     def handle_polish(self, body):
@@ -3083,12 +3124,50 @@ class H(BaseHTTPRequestHandler):
         cmd = [sys.executable, _PREVIEW_PY, os.path.join(pdir, "main.py")]
         if device:
             cmd += ["--device", device]
+        # Never send the preview's output to /dev/null. When it died -- no display, missing
+        # Kivy, or (most often) an app that never calls .run() so no window can ever open --
+        # the UI used to just say "opening preview window..." and sit there lying.
+        logp = os.path.join(pdir, "preview.log")
+        penv = dict(os.environ, KIVY_LOG_LEVEL="warning", KIVY_NO_ARGS="1",
+                    PYTHONUNBUFFERED="1")
         try:
-            subprocess.Popen(cmd, cwd=pdir, env=dict(os.environ),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logf = open(logp, "w")
+            proc = subprocess.Popen(cmd, cwd=pdir, env=penv,
+                                    stdout=logf, stderr=subprocess.STDOUT)
         except Exception as e:
             return self._send(500, {"error": "couldn't launch the preview: %s" % e})
-        return self._send(200, {"started": True, "device": device or "default"})
+        # A healthy preview keeps running (its window is open). One that fails does so
+        # almost immediately -- so wait briefly and report the reason instead of a toast.
+        deadline = time.time() + 3.0
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.15)
+        if proc.poll() is not None:
+            try:
+                logf.flush()
+            except Exception:
+                pass
+            raw = ""
+            try:
+                with open(logp) as f:
+                    raw = f.read()
+            except Exception:
+                pass
+            # Kivy prints a wall of INFO banners; the line that explains the failure is
+            # ours or a traceback. Lead with those so the reason isn't buried.
+            lines = raw.splitlines()
+            useful = [l for l in lines
+                      if l.startswith("[preview]") or "Error" in l or "error:" in l
+                      or l.startswith("Traceback") or l.strip().startswith("File \"")
+                      or l.startswith("    ") and l.strip() and not l.startswith("[")]
+            tail = "\n".join(useful[-14:]).strip() or "\n".join(lines[-12:]).strip()
+            if proc.returncode != 0:
+                return self._send(400, {
+                    "error": "the preview window closed straight away:\n\n" +
+                             (tail or "(no output)"),
+                    "log": logp})
+            return self._send(200, {"started": True, "device": device or "default",
+                                    "note": "the preview exited on its own", "log": logp})
+        return self._send(200, {"started": True, "device": device or "default", "log": logp})
 
     def _overrides_from(self, body):
         """Re-validate build overrides coming from the client (never trust a raw dict)."""
@@ -4005,6 +4084,7 @@ function pollJob(jid, done){
   }, 900);
 }
 
+var fixAttempt=0, fixLastErr='';
 async function autoFix(){
   if(!cur) return; collect();
   var done=busy('fixBtn','fixing');
@@ -4012,13 +4092,22 @@ async function autoFix(){
     var err=(cur.test_error||'')||
       (cur.issues||[]).filter(function(i){return i.sev==='error'||i.sev==='warn';})
         .map(function(i){return '- '+i.msg;}).join('\n');
+    if(!err.trim()){ toast('nothing to fix \u2014 run Self-test first','warn'); return; }
+    // asking again about the SAME error means the last answer didn't help: escalate so
+    // the server bypasses the response cache instead of replaying it
+    if(err===fixLastErr){ fixAttempt++; } else { fixAttempt=0; fixLastErr=err; }
     var r=await fetch('/api/fix',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements,
-                           permissions:cur.permissions, error:err})});
+                           permissions:cur.permissions, error:err, attempt:fixAttempt})});
     var d=await r.json();
     if(!r.ok){ toast(d.error||'fix failed','bad'); return; }
     d.name=cur.name||d.name; d.title=cur.title||d.title;
-    render(d); toast('fix applied \u2014 re-run the self-test','ok');
+    render(d);
+    if(d.unchanged){
+      toast('the model returned the same code \u2014 click Auto-fix again to force a fresh attempt','warn');
+    }else{
+      toast('fix applied \u2014 re-run the self-test','ok');
+    }
   }catch(e){ toast('network: '+e,'bad'); }
   finally{ done(); }
 }

@@ -34,6 +34,20 @@ DEVICES = {
                      "notch": "punch", "radius": 34, "category": "phone"},
     "moto_g":       {"label": "Moto G (budget)",       "w": 393, "h": 873, "dpi": 411,
                      "notch": "notch", "radius": 22, "category": "phone"},
+    # ASUS ROG gaming phones: 1080x2448 @ ~2.75x -> 393x890 logical. No cutout at all --
+    # the selfie camera sits in the top bezel -- and the corners are barely rounded.
+    "rog_phone_5s": {"label": "ASUS ROG Phone 5s",     "w": 393, "h": 890, "dpi": 395,
+                     "notch": "none",  "radius": 12, "category": "phone"},
+    "rog_phone_7":  {"label": "ASUS ROG Phone 7",      "w": 393, "h": 890, "dpi": 395,
+                     "notch": "none",  "radius": 14, "category": "phone"},
+    "nothing_2":    {"label": "Nothing Phone (2)",     "w": 412, "h": 915, "dpi": 394,
+                     "notch": "punch", "radius": 30, "category": "phone"},
+    "xiaomi_14":    {"label": "Xiaomi 14",             "w": 393, "h": 873, "dpi": 460,
+                     "notch": "punch", "radius": 28, "category": "phone"},
+    "redmi_note":   {"label": "Redmi Note (budget)",   "w": 393, "h": 873, "dpi": 395,
+                     "notch": "punch", "radius": 20, "category": "phone"},
+    "galaxy_a54":   {"label": "Samsung Galaxy A54",    "w": 385, "h": 854, "dpi": 403,
+                     "notch": "punch", "radius": 24, "category": "phone"},
     "generic_phone":{"label": "Generic phone (safe default)","w": 400, "h": 860, "dpi": 420,
                      "notch": "punch", "radius": 26, "category": "phone"},
     "small_phone":  {"label": "Small phone (stress test)","w": 360, "h": 760, "dpi": 400,
@@ -55,6 +69,13 @@ ALIASES = {
     "oneplus": "oneplus_12", "oneplus12": "oneplus_12", "moto": "moto_g",
     "phone": "generic_phone", "default": "pixel_8", "small": "small_phone",
     "tablet": "pixel_tablet", "pixeltablet": "pixel_tablet", "tab": "galaxy_tab",
+    # ROG (asked for by name -- the build defaults were tuned for one)
+    "rog": "rog_phone_5s", "rog5s": "rog_phone_5s", "rogphone5s": "rog_phone_5s",
+    "rogphone5": "rog_phone_5s", "rog5": "rog_phone_5s", "asus": "rog_phone_5s",
+    "rog7": "rog_phone_7", "rogphone7": "rog_phone_7",
+    "nothing": "nothing_2", "nothingphone2": "nothing_2",
+    "xiaomi": "xiaomi_14", "mi14": "xiaomi_14", "redmi": "redmi_note",
+    "a54": "galaxy_a54", "galaxya54": "galaxy_a54",
 }
 
 
@@ -87,12 +108,20 @@ def window_size(key=DEFAULT, max_h=880, scale=1.0):
 
     Real phone heights (~850-1000 dp) fit most screens, but we cap the long side to
     max_h by default so a tall phone doesn't run off a laptop display. `scale` multiplies
-    on top of that for manual zoom."""
+    on top of that for manual zoom.
+
+    The width is snapped to a multiple of 4. GL pixel rows are packed to a 4-byte
+    boundary, so a width whose 3-byte RGB row isn't a multiple of 4 (e.g. the ROG's 389)
+    makes every readback row slip by a byte -- the frame comes out sheared diagonally."""
     p = get(key)
     w, h = float(p["w"]), float(p["h"])
     fit = min(1.0, float(max_h) / h) if max_h else 1.0
     s = fit * float(scale or 1.0)
-    return max(240, int(round(w * s))), max(360, int(round(h * s)))
+    wi = max(240, int(round(w * s)))
+    hi = max(360, int(round(h * s)))
+    wi -= wi % 4                      # keep GL row stride aligned
+    hi -= hi % 2
+    return wi, hi
 
 
 def names():

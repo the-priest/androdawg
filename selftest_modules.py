@@ -27,10 +27,51 @@ def check(name, cond):
 
 
 # ------------------------------------------------------------------ devices.py
+def test_diagnosis():
+    """The self-test must name the REAL fault. It once reported a SystemExit during import
+    as a PASS and then blamed a missing App subclass -- so Auto-fix kept asking the model
+    for a class the app already had, and nothing ever changed."""
+    print("[modules] failure diagnosis (what Auto-fix is told)")
+    import importlib.util
+    import uuid
+    import apkforge as A
+    if importlib.util.find_spec("kivy") is None or not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+            or __import__("shutil").which("Xvfb") or __import__("shutil").which("xvfb-run")):
+        print("  (skipped -- needs kivy + a display)")
+        check("diagnosis test import ok", True)
+        return
+    src = ("import sys\n"
+           "from kivy.app import App\n"
+           "from kivy.uix.boxlayout import BoxLayout\n"
+           "sys.exit(1)\n"                      # aborts before the class below
+           "class RealApp(App):\n"
+           "    def build(self):\n"
+           "        return BoxLayout()\n"
+           "if __name__ == '__main__':\n"
+           "    RealApp().run()\n")
+    tid = uuid.uuid4().hex[:8]
+    A.TESTS[tid] = {"log": [], "status": "running", "summary": "", "phases": []}
+    A.run_test(tid, A.with_kit(src), "python3,kivy")
+    rec = A.TESTS[tid]
+    phases = {p["name"]: p for p in rec.get("phases", [])}
+    check("import phase FAILS on a SystemExit during import",
+          "import" in phases and not phases["import"]["ok"])
+    blame = (rec.get("error_text") or rec.get("summary") or "")
+    check("the reported cause mentions SystemExit", "SystemExit" in blame)
+    check("it does NOT misblame a missing App subclass",
+          "no App subclass found" not in blame)
+
+
 def test_devices():
     print("[modules] device profiles")
     import devices as D
     check("has a dozen-ish profiles", len(D.names()) >= 8)
+    # the build defaults target a ROG phone; it must actually be previewable
+    check("ROG Phone 5s profile exists", "rog_phone_5s" in D.names())
+    check("alias 'rog' resolves", D.resolve("rog")[0] == "rog_phone_5s")
+    rog = D.get("rog_phone_5s")
+    check("ROG has no notch (camera is in the bezel)", rog["notch"] == "none")
     k, p = D.resolve("pixel_8")
     check("resolves pixel_8", k == "pixel_8" and p["w"] > 0 and p["h"] > 0)
     check("alias s24 -> galaxy_s24", D.resolve("s24")[0] == "galaxy_s24")
@@ -39,6 +80,13 @@ def test_devices():
     w, h = D.window_size("pixel_8", max_h=880)
     check("window_size caps height", h <= 880 and w > 0)
     check("window keeps portrait aspect", h > w)
+    # GL packs pixel rows to 4 bytes: a width whose RGB row isn't 4-aligned (the ROG's
+    # 389) shears every captured frame diagonally. Every profile must come out aligned.
+    unaligned = [k for k in D.names() if D.window_size(k)[0] % 4]
+    check("every device width is 4-byte aligned", not unaligned)
+    for sc in (0.5, 0.75, 0.9, 1.0, 1.3):
+        bad = [k for k in D.names() if D.window_size(k, scale=sc)[0] % 4]
+        check("widths stay aligned at scale %s" % sc, not bad)
     check("table renders", "DEVICE" in D.table())
 
 
@@ -227,7 +275,37 @@ def test_preview():
         check("preview FAILS when the app never calls .run()", rc2 != 0)
 
 
+def test_autofix_honesty():
+    """Auto-fix must not claim success when the model handed back identical code, and a
+    repeat request must not replay the cached answer forever."""
+    print("[modules] auto-fix honesty")
+    import apkforge as A
+    seen = {}
+    same = ("<<<NAME>>>\napp\n<<<TITLE>>>\nApp\n<<<ORIENTATION>>>\nportrait\n"
+            "<<<REQUIREMENTS>>>\npython3,kivy\n<<<PERMISSIONS>>>\n\n<<<BUILD>>>\n\n"
+            "<<<MAIN_PY>>>\nfrom kivy.app import App\nfrom kivy.uix.boxlayout import BoxLayout\n"
+            "class MyApp(App):\n    def build(self):\n        return BoxLayout()\n"
+            "if __name__ == '__main__':\n    MyApp().run()\n<<<NOTES>>>\nx\n<<<END>>>")
+    real = A.call_ai
+
+    def fake(messages, **kw):
+        seen["no_cache"] = kw.get("no_cache")
+        seen["temp"] = kw.get("temperature")
+        return same, "Mock"
+    A.call_ai = fake
+    try:
+        A.ai_fix("x", "boom", "python3,kivy", "", attempt=0)
+        check("first attempt uses the cache", not seen.get("no_cache"))
+        A.ai_fix("x", "boom", "python3,kivy", "", attempt=1)
+        check("a repeat attempt bypasses the cache", bool(seen.get("no_cache")))
+        check("a repeat attempt raises temperature", (seen.get("temp") or 0) > 0.15)
+    finally:
+        A.call_ai = real
+
+
 if __name__ == "__main__":
+    test_diagnosis()
+    test_autofix_honesty()
     test_devices()
     test_iconsmith()
     test_render_quality()
