@@ -90,6 +90,13 @@ def test_apkforge_fixes():
     issues = A.analyze_code(A.with_kit(bad), "python3,kivy", "")
     check("analysis warns about class App(App)",
           any(i["sev"] == "warn" and "shadows" in i["msg"] for i in issues))
+    # REGRESSION: the repair renames the BASE to _KivyApp, and the analyser used to only
+    # recognise a literal `App` base -- so it then cried "no class X(App) found" on code
+    # it had itself just fixed. Repaired code must come back completely clean.
+    clean = A.analyze_code(A.with_kit(fixed), reqs, perms)
+    check("repaired code raises no false 'no class X(App)' warning",
+          not any("no `class X(App)`" in i["msg"] for i in clean))
+    check("repaired code is issue-free", not clean)
     # kit tolerates the bad kwargs that used to crash build()
     full = A.with_kit("from kivy.app import App\n"
                       "class MyApp(App):\n"
@@ -103,6 +110,83 @@ def test_apkforge_fixes():
 
 
 # ------------------------------------------------------------------ preview.py
+def test_render_quality():
+    """Regressions for defects that shipped green once: a hard black outline round every
+    two-letter monogram, a grey halo on the transparent layer, and multi-second renders."""
+    print("[modules] icon render quality + speed")
+    import time
+    import iconsmith as I
+
+    t0 = time.time()
+    png = I.icon_png("Alarm Clock", 256)
+    dt = time.time() - t0
+    check("a 256px icon renders in under 1s (was ~3s at 512)", dt < 1.0)
+
+    w, h, rows = _decode_png(png)
+
+    # 1. no hard black ring around the glyphs: opaque near-black pixels should be rare
+    black = sum(1 for y in range(h) for x in range(w)
+                if rows[y][x * 4 + 3] > 200 and max(rows[y][x * 4:x * 4 + 3]) < 60)
+    check("icon has no hard black outline", black < (w * h) * 0.01)
+
+    # 2. antialiased edges must not be muddy (correct source-over, not lerp-toward-black)
+    edge = muddy = 0
+    for y in range(h):
+        for x in range(w):
+            a = rows[y][x * 4 + 3]
+            if 20 < a < 235:
+                edge += 1
+                if max(rows[y][x * 4:x * 4 + 3]) < 120:
+                    muddy += 1
+    check("icon edges are clean", muddy <= edge * 0.15)
+
+    # 3. the transparent adaptive layer must not carry a dark halo
+    w2, h2, rows2 = _decode_png(I.adaptive_fg_png("Alarm Clock", 128))
+    e2 = m2 = 0
+    for y in range(h2):
+        for x in range(w2):
+            a = rows2[y][x * 4 + 3]
+            if 20 < a < 235:
+                e2 += 1
+                if max(rows2[y][x * 4:x * 4 + 3]) < 120:
+                    m2 += 1
+    check("adaptive foreground has no dark halo", m2 <= e2 * 0.15)
+
+    # 4. nothing may be painted outside the squircle silhouette (corners stay empty)
+    corner = rows[2][2 * 4 + 3]
+    check("icon corner stays transparent", corner == 0)
+
+
+def _decode_png(b):
+    """Minimal RGBA PNG reader (filters 0/1/2 only) so tests can inspect pixels."""
+    import zlib
+    import struct
+    pos, w, h, idat = 8, None, None, b""
+    while pos < len(b):
+        ln = struct.unpack(">I", b[pos:pos + 4])[0]
+        tag = b[pos + 4:pos + 8]
+        data = b[pos + 8:pos + 8 + ln]
+        if tag == b"IHDR":
+            w, h = struct.unpack(">II", data[:8])
+        elif tag == b"IDAT":
+            idat += data
+        pos += 12 + ln
+    raw = zlib.decompress(idat)
+    stride = w * 4
+    rows, prev, i = [], bytearray(stride), 0
+    for _y in range(h):
+        f = raw[i]; i += 1
+        line = bytearray(raw[i:i + stride]); i += stride
+        if f == 1:
+            for x in range(4, stride):
+                line[x] = (line[x] + line[x - 4]) & 255
+        elif f == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        rows.append(bytes(line)); prev = line
+    return w, h, rows
+
+
 def test_preview():
     print("[modules] preview (headless)")
     import preview as P
@@ -125,13 +209,28 @@ def test_preview():
             "    def build(self):\n"
             "        return GradientBackground()\n"
             "if __name__ == '__main__':\n    DemoApp().run()\n"))
+        P.RAN["started"] = False
         rc = P.main([mp, "--selftest", "--device", "pixel_8"])
         check("preview --selftest renders and exits 0", rc == 0)
+
+        # REGRESSION: an app that never calls .run() rendered nothing, yet the old
+        # preview still reported "selftest OK" and exited 0. A green light for a blank
+        # screen is worse than no check at all.
+        nr = os.path.join(d, "norun.py")
+        open(nr, "w").write("from kivy.app import App\n"
+                            "class ForgotApp(App):\n"
+                            "    def build(self):\n"
+                            "        from kivy.uix.widget import Widget\n"
+                            "        return Widget()\n")
+        P.RAN["started"] = False
+        rc2 = P.main([nr, "--selftest", "--device", "pixel_8"])
+        check("preview FAILS when the app never calls .run()", rc2 != 0)
 
 
 if __name__ == "__main__":
     test_devices()
     test_iconsmith()
+    test_render_quality()
     test_apkforge_fixes()
     test_preview()
     print()

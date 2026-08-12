@@ -882,10 +882,20 @@ def analyze_code(code, requirements, permissions=""):
                     "imports '%s' without an `if platform == \"android\":` guard -> crashes on desktop and risks a launch crash"
                     % root,
                     "Wrap the import in `from kivy.utils import platform` + `if platform == \"android\":`.")
-        # class App / run presence
+        # class App / run presence.
+        # The base may be aliased -- `from kivy.app import App as _KivyApp` is exactly what
+        # the free repair writes to break a `class App(App)` name collision -- so collect
+        # every local alias of kivy's App and accept any of them as a valid base. Without
+        # this, repaired (correct!) code got flagged "no class X(App) found".
+        app_aliases = {"App"}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("kivy.app"):
+                for al in n.names:
+                    if al.name == "App":
+                        app_aliases.add(al.asname or al.name)
         has_app = any(
             isinstance(n, ast.ClassDef) and any(
-                (isinstance(b, ast.Name) and b.id == "App") or
+                (isinstance(b, ast.Name) and b.id in app_aliases) or
                 (isinstance(b, ast.Attribute) and b.attr == "App") for b in n.bases)
             for n in ast.walk(tree))
         if not has_app:

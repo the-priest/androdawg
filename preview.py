@@ -168,6 +168,17 @@ def _install_chrome(prof, win_px):
     return chrome
 
 
+RAN = {"started": False}     # did the app actually reach App.run()?
+
+
+def _set_title(prof):
+    try:
+        from kivy.core.window import Window
+        Window.set_title("Preview - %s" % prof.get("label", "Android"))
+    except Exception:
+        pass
+
+
 def _patch_run(prof, win_px, frame):
     """Wrap App.run so the chrome goes on once the loop starts, without blocking import."""
     import kivy.app
@@ -175,20 +186,50 @@ def _patch_run(prof, win_px, frame):
 
     def run(self, *a, **k):
         from kivy.clock import Clock
+        RAN["started"] = True
         if frame:
             Clock.schedule_once(lambda dt: _install_chrome(prof, win_px), 0)
-        try:
-            Window_title(self, prof)
-        except Exception:
-            pass
+            Clock.schedule_once(lambda dt: _inset_root(self), 0)
+        _set_title(prof)
         return _orig(self, *a, **k)
 
     kivy.app.App.run = run
 
 
-def Window_title(app, prof):
-    from kivy.core.window import Window
-    Window.set_title("Preview - %s" % prof.get("label", "Android"))
+NO_RUN_MSG = (
+    "the file defines an App but never launched it, so there is nothing to show.\n"
+    "        Add this to the bottom of main.py:\n"
+    "            if __name__ == '__main__':\n"
+    "                YourApp().run()")
+
+
+def _inset_root(app):
+    """Sit the app's content inside the phone's safe area.
+
+    buildozer.spec ships `fullscreen = 0`, so on a real device the system status bar is
+    visible and the app gets the space BELOW it (and above the gesture bar). Without this
+    the preview draws the app full-bleed and its top row hides under our status bar --
+    which is not what the phone does."""
+    try:
+        from kivy.core.window import Window
+        from kivy.metrics import dp
+        root = getattr(app, "root", None)
+        if root is None:
+            return
+        top = dp(26)          # status bar
+        bottom = dp(18)       # gesture / home indicator
+        # only take over sizing when the root is a normal full-bleed root
+        if getattr(root, "size_hint", None) not in ((1, 1), [1, 1]):
+            return
+        root.size_hint = (None, None)
+
+        def _fit(*a):
+            root.size = (Window.width, max(1, Window.height - top - bottom))
+            root.pos = (0, bottom)
+        Window.bind(size=_fit)
+        _fit()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------------- selftest
@@ -211,14 +252,18 @@ def _run_selftest(mainpath, prof, win_px):
     _orig = kivy.app.App.run
 
     def run(self, *a, **k):
+        RAN["started"] = True
         Clock.schedule_once(lambda dt: _install_chrome(prof, win_px), 0)
+        Clock.schedule_once(lambda dt: _inset_root(self), 0)
         Clock.schedule_interval(_stop_soon, 0.05)
         Clock.schedule_once(lambda dt: self.stop(), 2.0)   # hard stop backstop
         return _orig(self, *a, **k)
 
     kivy.app.App.run = run
     runpy.run_path(mainpath, run_name="__main__")
-    return True
+    # An app that never called .run() rendered NOTHING. Reporting that as a pass is a lie
+    # -- it is exactly the failure the preview exists to catch.
+    return bool(RAN["started"])
 
 
 def main(argv=None):
@@ -243,17 +288,19 @@ def main(argv=None):
 
     if args.selftest:
         try:
-            _run_selftest(mainpath, prof, win_px)
-            print("[preview] selftest OK -- app rendered in the phone frame without crashing")
-            return 0
+            ok = _run_selftest(mainpath, prof, win_px)
         except SystemExit:
-            print("[preview] selftest OK (app exited cleanly)")
-            return 0
+            ok = bool(RAN["started"])
         except Exception as e:
             import traceback
             traceback.print_exc()
             print("[preview] selftest FAILED: %s" % e)
             return 1
+        if not ok:
+            print("[preview] selftest FAILED: " + NO_RUN_MSG)
+            return 1
+        print("[preview] selftest OK -- app rendered in the phone frame without crashing")
+        return 0
 
     _patch_run(prof, win_px, frame=not args.no_frame)
     try:
@@ -264,6 +311,10 @@ def main(argv=None):
         import traceback
         traceback.print_exc()
         print("[preview] app crashed: %s" % e)
+        return 1
+    if not RAN["started"]:
+        # no window ever opened -- say so instead of exiting 0 in silence
+        print("[preview] nothing opened: " + NO_RUN_MSG)
         return 1
     return 0
 

@@ -158,122 +158,205 @@ def _initials(name):
 
 
 # --------------------------------------------------------------------------- rasteriser
-def _blend(buf, W, H, x, y, col, cov):
+def _blend(buf, W, H, x, y, col, cov, mask=None):
+    """Correct straight-alpha 'source over' compositing.
+
+    The naive version (lerp RGB toward the source, then raise alpha) is wrong on a
+    TRANSPARENT canvas: the destination RGB there is 0,0,0, so every antialiased edge
+    pixel gets pulled toward black and the result is a grey halo around white artwork.
+    Doing real source-over means an edge pixel over emptiness keeps the source colour and
+    only its alpha varies -- which is what a compositor expects.
+
+    `mask` (optional, one byte per pixel) clips drawing to the icon silhouette so the
+    emblem and its shadow can never spill outside the squircle into the transparent
+    corners."""
     if x < 0 or y < 0 or x >= W or y >= H or cov <= 0:
         return
-    i = (y * W + x) * 4
-    a = max(0.0, min(1.0, cov))
-    for k in range(3):
-        buf[i + k] = int(buf[i + k] * (1 - a) + col[k] * a)
-    buf[i + 3] = max(buf[i + 3], int(255 * a)) if buf[i + 3] < 255 else buf[i + 3]
+    p = y * W + x
+    sa = cov if cov < 1.0 else 1.0
+    if mask is not None:
+        m = mask[p]
+        if not m:
+            return
+        if m < 255:
+            sa *= m / 255.0
+            if sa <= 0:
+                return
+    i = p * 4
+    da = buf[i + 3] / 255.0
+    oa = sa + da * (1.0 - sa)
+    if oa <= 0:
+        return
+    inv = da * (1.0 - sa)
+    buf[i] = int((col[0] * sa + buf[i] * inv) / oa + 0.5)
+    buf[i + 1] = int((col[1] * sa + buf[i + 1] * inv) / oa + 0.5)
+    buf[i + 2] = int((col[2] * sa + buf[i + 2] * inv) / oa + 0.5)
+    buf[i + 3] = int(oa * 255 + 0.5)
 
 
-def _stroke_seg(buf, W, H, x0, y0, x1, y1, r, col):
-    """Anti-aliased round-capped capsule from (x0,y0) to (x1,y1) of radius r."""
+def _stroke_seg(buf, W, H, x0, y0, x1, y1, r, col, mask=None, alpha=1.0):
+    """Anti-aliased round-capped capsule from (x0,y0) to (x1,y1) of radius r.
+    Coverage is computed analytically, so this needs no supersampling to look smooth."""
     minx = max(0, int(min(x0, x1) - r - 1)); maxx = min(W, int(max(x0, x1) + r + 2))
     miny = max(0, int(min(y0, y1) - r - 1)); maxy = min(H, int(max(y0, y1) + r + 2))
     dx = x1 - x0; dy = y1 - y0
     ll = dx * dx + dy * dy or 1.0
     aa = 1.2
+    r_in = r - aa
+    hyp = math.hypot
     for y in range(miny, maxy):
         for x in range(minx, maxx):
             t = ((x - x0) * dx + (y - y0) * dy) / ll
-            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
-            px = x0 + t * dx; py = y0 + t * dy
-            d = math.hypot(x - px, y - py)
-            if d <= r - aa:
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            d = hyp(x - (x0 + t * dx), y - (y0 + t * dy))
+            if d <= r_in:
                 cov = 1.0
             elif d >= r:
-                cov = 0.0
+                continue
             else:
                 cov = (r - d) / aa
-            if cov > 0:
-                _blend(buf, W, H, x, y, col, cov)
+            _blend(buf, W, H, x, y, col, cov * alpha, mask)
 
 
-def _draw_polylines(buf, W, H, polys, box, r, col):
+def _draw_polylines(buf, W, H, polys, box, r, col, mask=None, alpha=1.0):
     """Draw normalized (0..1) polylines mapped into box=(x,y,w,h)."""
     bx, by, bw, bh = box
     for poly in polys:
         pts = [(bx + p[0] * bw, by + p[1] * bh) for p in poly]
         for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
-            _stroke_seg(buf, W, H, x0, y0, x1, y1, r, col)
+            _stroke_seg(buf, W, H, x0, y0, x1, y1, r, col, mask, alpha)
 
 
 # --------------------------------------------------------------------------- composition
+def _emblem_layout(text, cx, cy, R, dy_bias=0.02):
+    """Geometry for the monogram: (list of per-glyph boxes, stroke radius)."""
+    two = len(text) == 2
+    gw = 0.72 if two else 0.42
+    gh = 0.44
+    bx = cx - gw * R
+    by = cy - gh * R + R * dy_bias
+    bw = gw * 2 * R
+    bh = gh * 2 * R
+    stroke = max(1.4, R * (0.072 if two else 0.085))
+    if two:
+        half = bw / 2.0
+        boxes = [(text[i], (bx + i * half + half * 0.08, by, half * 0.84, bh))
+                 for i in range(2)]
+    else:
+        boxes = [(text[0], (bx, by, bw, bh))]
+    return boxes, stroke
+
+
+def _draw_emblem(buf, W, H, boxes, stroke, fg, shadow_dy, mask=None, shadow=True):
+    """Soft drop shadow, then the crisp emblem on top. Exactly two passes -- an earlier
+    version also ran a stray black pass at zero offset, which left every two-letter icon
+    with a heavy black outline around its initials.
+
+    The shadow is translucent and offset, at the SAME stroke radius as the glyph. Drawing
+    it opaque and slightly fatter (the old `stroke * 1.06`) ringed every letter in hard
+    black -- that reads as a crude outline, not depth.
+
+    shadow=False for the adaptive FOREGROUND layer: the launcher applies its own elevation
+    shadow, and baking a black one into a transparent layer just leaves a dark halo."""
+    if shadow:
+        for ch, (bx, by, bw, bh) in boxes:
+            _draw_polylines(buf, W, H, _F.get(ch, _F["A"]),
+                            (bx, by + shadow_dy, bw, bh), stroke, (0, 0, 0), mask,
+                            alpha=0.26)
+    for ch, (bx, by, bw, bh) in boxes:
+        _draw_polylines(buf, W, H, _F.get(ch, _F["A"]),
+                        (bx, by, bw, bh), stroke, fg, mask)
+
+
 def _base_layer(name, size, ss, shape, transparent_outside):
-    """Render the gradient+emblem at size*ss, return (buf, W, H) premultiplied-ish RGBA."""
+    """Render the gradient + monogram at size*ss. Returns (buf, W, H).
+
+    Shape coverage and every stroke are anti-aliased ANALYTICALLY, so this looks smooth
+    without brute-force supersampling -- which is why ss defaults to 1 now. The hot loop
+    also precomputes the shape and gradient terms per row/column instead of recomputing
+    pow()/hypot() a million times per icon; the old version took ~3s for one 512px icon."""
     W = H = size * ss
     pal = palette(name)
     top, bot, fg = pal["top"], pal["bot"], pal["fg"]
     buf = bytearray(W * H * 4)
+    mask = bytearray(W * H)
     cx = cy = (W - 1) / 2.0
     R = W / 2.0
 
-    # diagonal gradient + subtle radial lift toward top-left for depth
+    # shape: |nx|^n + |ny|^n <= 1  (n=4 squircle / Android-12 shape, n=2 circle)
+    n = 2.0 if shape == "round" else 4.0
+    edge = 0.02 if shape == "round" else 0.045
+    inner_pow = (1.0 - edge) ** n
+    axs = [abs((x - cx) / R) ** n for x in range(W)]
+    ays = [abs((y - cy) / R) ** n for y in range(H)]
+    inv_n = 1.0 / n
+
+    # gradient runs along the main diagonal, so it only depends on (x + y): one LUT.
+    grad = []
+    for s in range(W + H - 1):
+        t = 0.5 + ((s - (cx + cy)) / R) * 0.42
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        grad.append((int(top[0] * (1 - t) + bot[0] * t),
+                     int(top[1] * (1 - t) + bot[1] * t),
+                     int(top[2] * (1 - t) + bot[2] * t)))
+
+    # the sheen is only non-zero inside a small disc; bound it instead of testing globally
+    sh_cx = cx - 0.4 * R
+    sh_cy = cy - 0.5 * R
+    sh_r = 0.5 * R
+    sh_x0 = max(0, int(sh_cx - sh_r)); sh_x1 = min(W, int(sh_cx + sh_r) + 1)
+    sh_y0 = max(0, int(sh_cy - sh_r)); sh_y1 = min(H, int(sh_cy + sh_r) + 1)
+    hyp = math.hypot
+
     for y in range(H):
+        ay = ays[y]
+        row = y * W
+        in_sheen_row = sh_y0 <= y < sh_y1
         for x in range(W):
-            nx = (x - cx) / R
-            ny = (y - cy) / R
-            if shape == "round":
-                a = _circle_alpha(nx, ny)
+            d = axs[x] + ay
+            if d >= 1.0:
+                if transparent_outside:
+                    continue                      # leave it fully transparent
+                a = 1.0
+            elif d <= inner_pow:
+                a = 1.0
             else:
-                a = _squircle_alpha(nx, ny, n=4.0)
-            if a <= 0 and transparent_outside:
-                continue
-            # gradient parameter along the main diagonal (top-left -> bottom-right)
-            t = max(0.0, min(1.0, (0.5 + (nx + ny) * 0.42)))
-            r = int(top[0] * (1 - t) + bot[0] * t)
-            g = int(top[1] * (1 - t) + bot[1] * t)
-            b = int(top[2] * (1 - t) + bot[2] * t)
-            # soft highlight sheen in the upper-left quadrant
-            sheen = max(0.0, 0.5 - math.hypot(nx + 0.4, ny + 0.5)) * 0.5
-            r = min(255, int(r + 255 * sheen * 0.25))
-            g = min(255, int(g + 255 * sheen * 0.25))
-            b = min(255, int(b + 255 * sheen * 0.25))
-            i = (y * W + x) * 4
+                a = (1.0 - d ** inv_n) / edge
+                if a <= 0.0:
+                    if transparent_outside:
+                        continue
+                    a = 0.0
+                elif a > 1.0:
+                    a = 1.0
+            r, g, b = grad[x + y]
+            if in_sheen_row and sh_x0 <= x < sh_x1:
+                s = 0.5 * R - hyp(x - sh_cx, y - sh_cy)
+                if s > 0:
+                    lift = int(31.875 * s / R)    # 255 * (s/R) * 0.5 * 0.25
+                    r += lift; g += lift; b += lift
+                    if r > 255: r = 255
+                    if g > 255: g = 255
+                    if b > 255: b = 255
+            p = row + x
+            i = p * 4
             buf[i] = r; buf[i + 1] = g; buf[i + 2] = b
-            buf[i + 3] = int(255 * a) if transparent_outside else 255
+            av = int(255 * a) if transparent_outside else 255
+            buf[i + 3] = av
+            mask[p] = av
 
-    # emblem: initials, centred, with a soft shadow underneath for depth
     text = _initials(name)
-    gw = 0.42 if len(text) == 1 else 0.72     # emblem box width in icon fractions
-    gh = 0.44
-    bx = cx - gw * R
-    by = cy - gh * R + R * 0.02
-    box = (bx, by, gw * 2 * R, gh * 2 * R)
-    stroke = max(2.0, R * (0.085 if len(text) == 1 else 0.072))
-
-    # per-letter layout when two initials
-    if len(text) == 2:
-        half = (gw * 2 * R) / 2.0
-        for idx, ch in enumerate(text):
-            sub = (bx + idx * half + half * 0.08, by, half * 0.84, gh * 2 * R)
-            _draw_polylines(buf, W, H, [[(sx, sy) for (sx, sy) in poly]  # noqa
-                                        for poly in _F.get(ch, _F["A"])],
-                            sub, stroke * 1.0, (0, 0, 0))  # shadow pass handled below
-        # redo cleanly with shadow + fill (the loop above is replaced below)
-        buf_reset = None  # keep linter calm; real draw follows
-    # --- draw shadow then fill (single, correct pass) ---
-    def _emblem(col, dyoff, r):
-        if len(text) == 2:
-            half = (gw * 2 * R) / 2.0
-            for idx, ch in enumerate(text):
-                sub = (bx + idx * half + half * 0.08, by + dyoff, half * 0.84, gh * 2 * R)
-                _draw_polylines(buf, W, H, _F.get(ch, _F["A"]), sub, r, col)
-        else:
-            ch = text[0]
-            sub = (cx - gw * R, by + dyoff, gw * 2 * R, gh * 2 * R)
-            _draw_polylines(buf, W, H, _F.get(ch, _F["A"]), sub, r, col)
-
-    # clear any stray shadow-test pixels by re-rendering the gradient is overkill; instead
-    # we simply draw the real shadow (translucent black, offset) then the white emblem.
-    _emblem((0, 0, 0), R * 0.02, stroke * 1.06)   # drop shadow
-    _emblem(fg, 0.0, stroke)                        # crisp white emblem
+    boxes, stroke = _emblem_layout(text, cx, cy, R)
+    _draw_emblem(buf, W, H, boxes, stroke, fg, R * 0.02,
+                 mask if transparent_outside else None)
     return buf, W, H
 
 
 def _downsample(buf, W, H, size, ss):
+    if ss == 1:
+        return buf                      # analytic AA already: nothing to average
     out = bytearray(size * size * 4)
     n = ss * ss
     for y in range(size):
@@ -288,43 +371,28 @@ def _downsample(buf, W, H, size, ss):
     return out
 
 
-def icon_png(name, size=512, shape="squircle", ss=2):
+def icon_png(name, size=512, shape="squircle", ss=1):
     buf, W, H = _base_layer(name, size, ss, shape, transparent_outside=True)
     return _png_bytes(size, size, _downsample(buf, W, H, size, ss))
 
 
-def icon_round_png(name, size=512, ss=2):
+def icon_round_png(name, size=512, ss=1):
     return icon_png(name, size, shape="round", ss=ss)
 
 
-def presplash_png(name, size=720, ss=2):
-    # emblem centred on the brand background, no rounded mask (full-bleed splash)
+def presplash_png(name, size=720, ss=1):
+    """Emblem centred on the brand background -- full-bleed, no rounded mask."""
     pal = palette(name)
     W = H = size * ss
-    buf = bytearray(W * H * 4)
     bg = pal["splash_bg"]
-    for i in range(0, len(buf), 4):
-        buf[i] = bg[0]; buf[i + 1] = bg[1]; buf[i + 2] = bg[2]; buf[i + 3] = 255
+    # solid fill via one bytes multiply instead of a per-pixel Python loop
+    buf = bytearray(bytes((bg[0], bg[1], bg[2], 255)) * (W * H))
     cx = cy = (W - 1) / 2.0
     R = W / 2.0
     text = _initials(name)
-    gw = 0.20 if len(text) == 1 else 0.34
-    gh = 0.22
-    bx = cx - gw * R
-    by = cy - gh * R
-    stroke = max(2.0, R * (0.040 if len(text) == 1 else 0.034))
-
-    def _emblem(col, dyoff, r):
-        if len(text) == 2:
-            half = (gw * 2 * R) / 2.0
-            for idx, ch in enumerate(text):
-                sub = (bx + idx * half + half * 0.08, by + dyoff, half * 0.84, gh * 2 * R)
-                _draw_polylines(buf, W, H, _F.get(ch, _F["A"]), sub, r, col)
-        else:
-            sub = (bx, by + dyoff, gw * 2 * R, gh * 2 * R)
-            _draw_polylines(buf, W, H, _F.get(text[0], _F["A"]), sub, r, col)
-    _emblem((0, 0, 0), R * 0.012, stroke * 1.1)
-    _emblem(pal["fg"], 0.0, stroke)
+    # the splash emblem sits smaller than the icon's: scale the shared layout down
+    boxes, stroke = _emblem_layout(text, cx, cy, R * 0.47, dy_bias=0.0)
+    _draw_emblem(buf, W, H, boxes, stroke, pal["fg"], R * 0.012)
     return _png_bytes(size, size, _downsample(buf, W, H, size, ss))
 
 
@@ -333,7 +401,7 @@ def presplash_hex(name):
     return "#%02x%02x%02x" % bg
 
 
-def adaptive_bg_png(name, size=512, ss=2):
+def adaptive_bg_png(name, size=512, ss=1):
     """Full-bleed gradient, no emblem -- the adaptive-icon background layer."""
     pal = palette(name)
     W = H = size * ss
@@ -341,42 +409,30 @@ def adaptive_bg_png(name, size=512, ss=2):
     buf = bytearray(W * H * 4)
     cx = cy = (W - 1) / 2.0
     R = W / 2.0
+    # the diagonal gradient depends only on (x + y): build one row LUT, then fill rows
+    grad = []
+    for s in range(W + H - 1):
+        t = 0.5 + ((s - (cx + cy)) / R) * 0.42
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        grad.append(bytes((int(top[0] * (1 - t) + bot[0] * t),
+                           int(top[1] * (1 - t) + bot[1] * t),
+                           int(top[2] * (1 - t) + bot[2] * t), 255)))
     for y in range(H):
-        for x in range(W):
-            nx = (x - cx) / R; ny = (y - cy) / R
-            t = max(0.0, min(1.0, (0.5 + (nx + ny) * 0.42)))
-            i = (y * W + x) * 4
-            buf[i] = int(top[0] * (1 - t) + bot[0] * t)
-            buf[i + 1] = int(top[1] * (1 - t) + bot[1] * t)
-            buf[i + 2] = int(top[2] * (1 - t) + bot[2] * t)
-            buf[i + 3] = 255
+        row = b"".join(grad[y:y + W])
+        off = y * W * 4
+        buf[off:off + W * 4] = row
     return _png_bytes(size, size, _downsample(buf, W, H, size, ss))
 
 
-def adaptive_fg_png(name, size=512, ss=2):
+def adaptive_fg_png(name, size=512, ss=1):
     """Transparent layer carrying only the emblem, sized into the adaptive safe zone."""
     W = H = size * ss
     buf = bytearray(W * H * 4)
     cx = cy = (W - 1) / 2.0
     R = W / 2.0 * 0.66            # keep the emblem inside the 66% adaptive safe zone
     pal = palette(name)
-    text = _initials(name)
-    gw = 0.42 if len(text) == 1 else 0.72
-    gh = 0.44
-    bx = cx - gw * R; by = cy - gh * R
-    stroke = max(2.0, R * (0.085 if len(text) == 1 else 0.072))
-
-    def _emblem(col, dyoff, r):
-        if len(text) == 2:
-            half = (gw * 2 * R) / 2.0
-            for idx, ch in enumerate(text):
-                sub = (bx + idx * half + half * 0.08, by + dyoff, half * 0.84, gh * 2 * R)
-                _draw_polylines(buf, W, H, _F.get(ch, _F["A"]), sub, r, col)
-        else:
-            sub = (bx, by + dyoff, gw * 2 * R, gh * 2 * R)
-            _draw_polylines(buf, W, H, _F.get(text[0], _F["A"]), sub, r, col)
-    _emblem((0, 0, 0), R * 0.02, stroke * 1.06)
-    _emblem(pal["fg"], 0.0, stroke)
+    boxes, stroke = _emblem_layout(_initials(name), cx, cy, R, dy_bias=0.0)
+    _draw_emblem(buf, W, H, boxes, stroke, pal["fg"], R * 0.02, shadow=False)
     return _png_bytes(size, size, _downsample(buf, W, H, size, ss))
 
 
