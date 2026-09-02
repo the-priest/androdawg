@@ -177,11 +177,13 @@ PYBIN="$(command -v python3 || command -v python)"
 "$PYBIN" -m pip install --user --break-system-packages "cython==0.29.36" buildozer \
   || echo "[dawg]   ERROR: buildozer pip install failed"
 
-# 3b) host Kivy for the headless self-test (OPTIONAL - never fails the install).
-echo "[dawg] (optional) installing host Kivy for the self-test..."
-"$PYBIN" -m pip install --user --break-system-packages "kivy" >/dev/null 2>&1 \
-  && echo "[dawg]   host Kivy ready -> the self-test will catch launch crashes" \
-  || echo "[dawg]   host Kivy not installed (self-test will be skipped; builds still work)"
+# 3b) host Kivy for the headless crash check (OPTIONAL - never fails the install).
+#     Pinned to 2.3.1 to match what the pre-build crash check runs against. If this is
+#     skipped, the app can still set up its own isolated Kivy later via "Enable crash check".
+echo "[dawg] (optional) installing host Kivy 2.3.1 for the crash check..."
+"$PYBIN" -m pip install --user --break-system-packages "kivy==2.3.1" >/dev/null 2>&1 \
+  && echo "[dawg]   host Kivy ready -> the crash check will launch your app and tap every button" \
+  || echo "[dawg]   host Kivy not installed (use 'Enable crash check' in-app to set up an isolated one)"
 
 # 4) fetch app + sibling modules + icon from the local checkout, or GitHub as a fallback
 echo "[dawg] fetching app + modules + icon..."

@@ -93,6 +93,7 @@ ANDROID_ARCHS = "arm64-v8a"
 BUILDS = {}   # build_id -> {"log":[...], "status": "...", "apk": path|None}
 TESTS = {}    # test_id  -> {"log":[...], "status": "...", "summary": str}
 JOBS = {}     # job_id   -> agent-loop record (steps, payload, status)
+PROVISION = {}  # prov_id -> {"log":[...], "status": "...", "message": str}
 
 # ----------------------------------------------------------------- token accounting
 # Every AI call is metered here so the UI can show exactly what a session costs and
@@ -187,7 +188,7 @@ def groq_key():
 # ----------------------------------------------------------------- UI KIT (prepended to forged apps)
 KIT_BEGIN = "# ===== DAWG UI KIT"
 KIT_END = "# ===== END DAWG UI KIT ====="
-KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\ndef _kit_col(c, fallback):\n    """Coerce anything into a valid RGBA colour, so a stray bool/None/str can\'t crash a\n    widget at build time. Accepts a 3/4-tuple, a #hex string, or falls back."""\n    try:\n        if isinstance(c, str) and c.strip():\n            return _hx(c)\n        if isinstance(c, (tuple, list)) and len(c) in (3, 4):\n            return tuple(list(c) + [1])[:4]\n    except Exception:\n        pass\n    return fallback\n\n\ndef _kit_int(v, fallback):\n    """Coerce to a positive int (for counts like gradient strips)."""\n    try:\n        v = int(v)\n        return v if v > 0 else fallback\n    except Exception:\n        return fallback\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=48, **kw):\n        super().__init__(**kw)\n        self._top = _kit_col(top, Theme.bg)\n        self._bottom = _kit_col(bottom, Theme.bg2)\n        self._strips = _kit_int(strips, 48)\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(_kit_col(fill, Theme.surface), radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft shadow: two translucent offset rects\n            Color(0, 0, 0, 0.22)\n            RoundedRectangle(pos=(self.x, self.y - dp(3)),\n                             size=(self.width, self.height), radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "middle")\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "top")\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n# ===== END DAWG UI KIT =====\n'
+KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.uix.scrollview import ScrollView\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\ndef _kit_col(c, fallback):\n    """Coerce anything into a valid RGBA colour, so a stray bool/None/str can\'t crash a\n    widget at build time. Accepts a 3/4-tuple, a #hex string, or falls back."""\n    try:\n        if isinstance(c, str) and c.strip():\n            return _hx(c)\n        if isinstance(c, (tuple, list)) and len(c) in (3, 4):\n            return tuple(list(c) + [1])[:4]\n    except Exception:\n        pass\n    return fallback\n\n\ndef _kit_int(v, fallback):\n    """Coerce to a positive int (for counts like gradient strips)."""\n    try:\n        v = int(v)\n        return v if v > 0 else fallback\n    except Exception:\n        return fallback\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=64, **kw):\n        super().__init__(**kw)\n        self._top = _kit_col(top, Theme.bg)\n        self._bottom = _kit_col(bottom, Theme.bg2)\n        self._strips = _kit_int(strips, 48)\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(_kit_col(fill, Theme.surface), radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft, layered drop shadow (three stacked, fading offsets)\n            for _o, _a in ((dp(6), 0.10), (dp(3), 0.16), (dp(1), 0.22)):\n                Color(0, 0, 0, _a)\n                RoundedRectangle(pos=(self.x, self.y - _o),\n                                 size=(self.width, self.height),\n                                 radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "middle")\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "top")\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n\nclass Row(BoxLayout):\n    """Horizontal group with sensible spacing -- put buttons/chips side by side."""\n    def __init__(self, height=dp(52), **kw):\n        kw.setdefault("orientation", "horizontal")\n        kw.setdefault("spacing", Theme.gap)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", height)\n        super().__init__(**kw)\n\n\nclass Chip(Label, _Rounded):\n    """Small rounded pill for tags/labels. fill takes an rgba tuple or Theme colour."""\n    def __init__(self, text="", fill=None, **kw):\n        kw.setdefault("font_size", sp(13))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("padding", (dp(12), dp(6)))\n        kw.setdefault("color", Theme.on_primary)\n        super().__init__(text=text, **kw)\n        self.texture_update()\n        self.size = (self.texture_size[0] + dp(24), self.texture_size[1] + dp(14))\n        self._paint(_kit_col(fill, Theme.primary), radius=self.height / 2.0, border=None)\n\n\nclass Meter(Widget):\n    """Themed progress/meter bar. value is 0..1; call set_progress(v) to update."""\n    def __init__(self, value=0.0, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(10))\n        super().__init__(**kw)\n        try:\n            self._value = max(0.0, min(1.0, float(value)))\n        except Exception:\n            self._value = 0.0\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def set_progress(self, v):\n        try:\n            self._value = max(0.0, min(1.0, float(v)))\n        except Exception:\n            self._value = 0.0\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self.height / 2.0])\n            Color(*Theme.primary)\n            RoundedRectangle(pos=self.pos,\n                             size=(self.width * self._value, self.height),\n                             radius=[self.height / 2.0])\n\n\nclass Scaffold(FloatLayout):\n    """One-call polished screen: gradient background + AppBar + a scrollable, padded\n    content column. Return it from build(); add your widgets via .add(widget) (or to\n    .content). Everything grows and scrolls on its own -- the fastest route to a\n    screen that looks designed instead of default-Kivy."""\n    def __init__(self, title="App", subtitle="", **kw):\n        super().__init__(**kw)\n        self.add_widget(GradientBackground(size_hint=(1, 1)))\n        col = BoxLayout(orientation="vertical", size_hint=(1, 1))\n        col.add_widget(AppBar(title=title, subtitle=subtitle))\n        sv = ScrollView(size_hint=(1, 1), bar_width=dp(3))\n        self.content = BoxLayout(orientation="vertical", size_hint_y=None,\n                                 padding=Theme.pad, spacing=Theme.gap)\n        self.content.bind(minimum_height=self.content.setter("height"))\n        sv.add_widget(self.content)\n        col.add_widget(sv)\n        self.add_widget(col)\n\n    def add(self, widget):\n        """Add a widget to the scrolling content column and return it."""\n        self.content.add_widget(widget)\n        return widget\n\n# ===== END DAWG UI KIT =====\n'
 
 
 def ensure_kit(code):
@@ -292,12 +293,18 @@ def kit_api_reference():
     L.append("    Call Theme.seed(\"Your App Name\") ONCE at startup to derive a unique "
              "primary/accent from the name.")
     sigs = [
-        ("GradientBackground", "FloatLayout that paints a vertical gradient. Use as your root."),
+        ("Scaffold", "EASIEST polished screen -- gradient bg + AppBar + a scrolling, padded "
+                     "content column in one call. Return it from build(); add widgets with "
+                     "root.add(widget). Prefer this as your root unless you need a custom layout."),
+        ("GradientBackground", "FloatLayout that paints a vertical gradient. A manual root."),
         ("AppBar", "top bar."),
-        ("Card", "rounded raised surface (a BoxLayout)."),
-        ("PillButton", "rounded button; bind on_release."),
+        ("Card", "rounded raised surface with a soft drop shadow (a BoxLayout)."),
+        ("PillButton", "rounded animated button; bind on_release."),
         ("IconButton", "round compact button."),
         ("TextField", "rounded text input; read .text."),
+        ("Row", "horizontal group with spacing -- put buttons/chips side by side."),
+        ("Chip", "small rounded pill for tags/labels; fill takes a Theme colour."),
+        ("Meter", "themed progress/meter bar; value 0..1, call .set_progress(v)."),
         ("Divider", "thin separator line."),
     ]
     for name, blurb in sigs:
@@ -490,7 +497,7 @@ HARD RULES
 - Output a single self-contained app. No placeholders, no TODO, no "...". Real working code top to bottom.
 - Kivy ONLY. NEVER tkinter / PyQt / PySide / GTK(gi) / wx / curses / pygame -- none of them survive python-for-android.
 - Subclass App, but NEVER name your class `App`. `class App(App):` shadows Kivy's own App and fails to launch. Name it for the app, e.g. `class AlarmClockApp(App):`, and end the file with `if __name__ == "__main__":` then `AlarmClockApp().run()`.
-- Build your UI in build() returning a GradientBackground root with an AppBar + Card(s). Make it genuinely nice: clear hierarchy, generous spacing (dp), big touch targets (>= 48dp), obvious feedback on every tap. No dead grey default widgets.
+- Build your UI in build(). The fastest route to a designed-looking screen is to return a Scaffold(title=..., subtitle=...) root and root.add(...) your Cards/Rows/Buttons into it -- it gives you the gradient background, top bar, and smooth scrolling for free. Use a GradientBackground root by hand only when you need a custom layout. Make it genuinely nice: clear hierarchy, generous spacing (dp), big touch targets (>= 48dp), obvious feedback on every tap, and use Chips for tags/status and Meter for any progress. No dead grey default widgets.
 - ONLY pass constructor keywords that exist. The kit constructor signatures are listed in the API reference above; passing an invented keyword (e.g. Card(fill=True), GradientBackground(strips=[])) is a crash. Kit fill/top/bottom take an RGBA colour tuple or a Theme colour, never a bool; strips is an int. The helpers heading()/body() take (text, size=...) and return a Label -- style them via that Label, don't pass layout kwargs they don't accept.
 - Drive everything with touch + on-screen widgets. Do NOT assume a hardware keyboard (except TextField input).
 - Guard ALL android-only imports behind platform, and request runtime permissions only when actually used:
@@ -550,7 +557,7 @@ POLISH_PROMPT = """You are The Dawg (APK edition), a senior Android UI engineer.
 You are shown the app code ONLY -- the kit sits above it and is already in scope. Return the app code ONLY. Never output the kit; if you do, the response is discarded and the round is wasted.
 
 Make these improvements:
-- Replace bare/default widgets with kit components (GradientBackground root, AppBar, Cards, PillButtons).
+- Replace bare/default widgets with kit components (a Scaffold or GradientBackground root, AppBar, Cards, PillButtons, Chips for tags, Meter for progress).
 - Apply Theme colors; call Theme.seed(<app name>) at startup if not already.
 - Tighten layout: consistent dp spacing/padding, clear visual hierarchy, big touch targets, satisfying feedback on tap.
 - Keep it Kivy-only, keep all android imports guarded by platform, keep user_data_dir for saves, add no new external assets.
@@ -563,11 +570,11 @@ FIX_PROMPT = """You are The Dawg (APK edition), a Kivy/Android debugging expert.
 """ + _KIT_CONTRACT + """
 You are shown the app code ONLY -- the kit sits above it, unchanged and already in scope. Return the app code ONLY. Never output the kit.
 
-Line numbers in a traceback refer to the FULL file (kit + app). The kit is %d lines, so app line N appears as line N+%d in a traceback -- subtract before you go looking.
+Line numbers in the error are ALREADY app-relative -- they match the code you are holding, and the exact offending line is quoted after each frame as `>>> <code>`. Go straight to that line; do not add or subtract any offset.
 
 Common Android launch killers to check and fix:
 - A Theme attribute or kit keyword that does not exist (check the API list above -- Theme attributes are lowercase).
-- Unguarded android-only imports (must be behind `if platform == "android":`).""" % (kit_line_offset(), kit_line_offset()) + """
+- Unguarded android-only imports (must be behind `if platform == "android":`).""" + """
 - A third-party import not listed in requirements (add it ONLY if it's in the allowed recipe set: pillow, requests, certifi, urllib3, idna, plyer, numpy; otherwise reimplement with stdlib/Kivy).
 - File writes to a relative path / cwd instead of user_data_dir.
 - References to image/sound files that don't exist (draw/generate instead).
@@ -1400,6 +1407,85 @@ def host_has_kivy():
         return False
 
 
+# ------------------------------------------------------------- managed test venv
+# The pre-build crash check is the single most valuable thing this tool does -- it's the
+# difference between catching a launch crash in 5 seconds here and finding it after a
+# 40-minute build + install on the phone. In v3 it needed desktop Kivy on the host; if
+# that was missing the whole check SILENTLY became "static analysis only" and a crashing
+# APK sailed through. So we manage our own throwaway Kivy in a venv: provision once, and
+# the crash check works forever after, on any host, without touching system packages.
+TESTENV = os.path.join(os.path.expanduser("~"), ".androdawg", "testenv")
+
+
+def testenv_python():
+    """Path to the managed venv's python if it exists AND has kivy, else None."""
+    py = os.path.join(TESTENV, "bin", "python")
+    if not os.path.exists(py):
+        return None
+    try:
+        r = subprocess.run([py, "-c", "import kivy"], capture_output=True, timeout=20)
+        return py if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def test_python():
+    """The interpreter used for the self-test: the managed venv first (isolated, known-good),
+    else the host interpreter if IT has kivy. None means no way to run the app here yet."""
+    py = testenv_python()
+    if py:
+        return py
+    return sys.executable if host_has_kivy() else None
+
+
+def testenv_ready():
+    return testenv_python() is not None
+
+
+def provision_testenv(log=None):
+    """Create the managed venv and install a desktop Kivy into it. Returns (ok, message).
+    Heavy (~25MB download) but one-time; everything after is instant. Safe to call twice."""
+    def _say(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    if testenv_ready():
+        return True, "the crash-check environment is already set up."
+    try:
+        os.makedirs(os.path.dirname(TESTENV), exist_ok=True)
+    except Exception as e:
+        return False, "couldn't create ~/.androdawg: %s" % e
+    py = os.path.join(TESTENV, "bin", "python")
+    if not os.path.exists(py):
+        _say("creating an isolated Python environment (one time)...")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", TESTENV],
+                           capture_output=True, text=True, timeout=120, check=True)
+        except Exception as e:
+            return False, ("couldn't create the venv (%s). If your Python lacks venv, "
+                           "install it -- e.g. Debian/Ubuntu: sudo apt install python3-venv." % e)
+    _say("installing a desktop Kivy for the crash check (~25MB, one time)...")
+    try:
+        subprocess.run([py, "-m", "pip", "install", "--upgrade", "pip"],
+                       capture_output=True, text=True, timeout=180)
+        proc = subprocess.run([py, "-m", "pip", "install", "kivy==2.3.1"],
+                              capture_output=True, text=True, timeout=1200)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "")[-500:]
+            return False, "pip couldn't install Kivy into the venv:\n" + tail
+    except subprocess.TimeoutExpired:
+        return False, "installing Kivy timed out. Check the network and try again."
+    except Exception as e:
+        return False, "installing Kivy failed: %s" % e
+    if not testenv_ready():
+        return False, ("Kivy installed but won't import in the venv -- your machine may be "
+                       "missing a system GL/SDL library the wheel expects.")
+    _say("crash-check environment ready.")
+    return True, "crash-check environment ready -- the self-test will now run on every check."
+
+
 # ------------------------------------------------------------- distro-aware install hints
 def _pkg_manager():
     """Best-effort detection of the system package manager, for actionable error hints."""
@@ -1429,7 +1515,8 @@ def host_can_display():
 
 
 def host_can_test():
-    return host_has_kivy() and host_can_display()
+    # Either the host has kivy, or we've provisioned our own -- plus a display (or Xvfb).
+    return (test_python() is not None) and host_can_display()
 
 
 def doctor():
@@ -1449,13 +1536,14 @@ def doctor():
     checks.append(["SILICONFLOW key", bool(sf_key())])
     checks.append(["GROQ key", bool(groq_key())])
     checks.append(["~/.buildozer cache", os.path.isdir(os.path.expanduser("~/.buildozer"))])
-    # test-run capability (not required to build, but enables the pre-build crash check)
+    # pre-build crash check: works if the host has kivy OR we've provisioned our own venv
     if host_can_test():
-        checks.append(["test-run (kivy + display)", True])
-    elif host_has_kivy():
-        checks.append(["test-run: kivy ok, no display (install xvfb)", False])
+        via = "own env" if testenv_ready() and not host_has_kivy() else "kivy + display"
+        checks.append(["crash check (%s)" % via, True])
+    elif test_python() is not None:
+        checks.append(["crash check: kivy ok, no display (install xvfb)", False])
     else:
-        checks.append(["test-run: kivy not on host (pip install kivy) - optional", False])
+        checks.append(["crash check: not set up - click Enable crash check", False])
     return checks
 
 # ----------------------------------------------------------------- smoke + templates
@@ -1908,6 +1996,48 @@ def _finish_ai(payload, provider, requirements, permissions):
     return payload
 
 
+def app_line_base(full_code):
+    """How many lines sit above app line 1 in the FULL file (kit + separator), computed the
+    exact same way strip_kit() finds the boundary so the two can never drift. kit_line_offset()
+    counts only the kit body and is 2 short (it misses with_kit's blank separator) -- using it
+    to remap a traceback points the model two lines off, which is how 'fixes the wrong line'
+    happened. This is the correct number for line translation."""
+    code = full_code or ""
+    if KIT_END not in code:
+        return 0
+    before, after = code.split(KIT_END, 1)
+    return before.count("\n") + (len(after) - len(after.lstrip("\n")))
+
+
+def app_relative_error(error, full_code):
+    """Rewrite a self-test/traceback so every line number is APP-relative (the model only ever
+    sees the app, kit stripped) and splice in the real source line it names. Models can't
+    subtract a 330-line offset in their head, so we do it for them and quote the exact line."""
+    if not error:
+        return error
+    base = app_line_base(full_code)
+    if not base:
+        return error  # no kit present -> line numbers are already app-relative
+    app_lines = strip_kit(full_code).splitlines()
+
+    # pass 1: remap every "line N" to app-relative, exactly once each
+    def _remap(m):
+        app_ln = int(m.group(1)) - base
+        return "line %d" % app_ln if app_ln >= 1 else "line ?(this frame is inside the UI kit)"
+    out = re.sub(r"\bline (\d+)\b", _remap, error)
+
+    # pass 2: quote the real source line onto each app frame the traceback names
+    def _splice(m):
+        try:
+            app_ln = int(m.group(1))
+        except Exception:
+            return m.group(0)
+        src = app_lines[app_ln - 1].strip() if 1 <= app_ln <= len(app_lines) else ""
+        return m.group(0) + ("   >>> " + src if src else "")
+    out = re.sub(r'File "main\.py", line (\d+)(?:, in \S+)?', _splice, out)
+    return out
+
+
 def ai_fix(main_py, error, requirements, permissions, attempt=0):
     """Fix a fault. Sends APP CODE ONLY -- the 300-line kit never crosses the wire.
 
@@ -1915,6 +2045,9 @@ def ai_fix(main_py, error, requirements, permissions, attempt=0):
     skip the response cache and loosen the temperature a little, otherwise the same
     cached answer comes back and Auto-fix appears to do nothing."""
     app = strip_kit(main_py or "")
+    # Point the model at code it can actually see: app-relative line numbers + the real line.
+    # We pass the FULL file so the offset is derived exactly the way strip_kit split it.
+    error = app_relative_error(error, main_py or "")
     msg = ("ERROR / FINDINGS:\n" + (error or "(none given)")
            + "\n\nDECLARED requirements: " + (requirements or "python3,kivy")
            + "\nDECLARED permissions: " + (permissions or "(none)")
@@ -2339,9 +2472,15 @@ def run_test(test_id, main_py, requirements):
         if len(rec["log"]) > 4000:
             del rec["log"][:1000]
 
-    if not host_has_kivy():
+    py = test_python()
+    if py is None:
         rec["status"] = "skipped"
-        rec["summary"] = "kivy isn't installed on this machine, so the app can't be test-run here. Install it once with: pip install --user kivy   (optional -- it only powers the pre-build crash check, the APK build doesn't need it)."
+        rec["needs_provision"] = True
+        rec["summary"] = ("the pre-build crash check can't run because there's no desktop Kivy "
+                          "to run your app against. Click 'Enable crash check' to set up an "
+                          "isolated one automatically (one-time ~25MB, won't touch your system "
+                          "packages) -- then every check actually launches the app and taps "
+                          "every button before you spend 40 minutes on a build.")
         log(rec["summary"])
         return
     if not host_can_display():
@@ -2381,7 +2520,7 @@ def run_test(test_id, main_py, requirements):
                SDL_AUDIODRIVER="dummy")  # no audio device on a virtual display
     xvfb_proc = None
     if shutil.which("xvfb-run"):
-        cmd = ["xvfb-run", "-a", sys.executable, "__dawg_run.py"]
+        cmd = ["xvfb-run", "-a", py, "__dawg_run.py"]
     elif shutil.which("Xvfb"):
         disp, xvfb_proc = _start_xvfb()
         if disp is None:
@@ -2390,9 +2529,9 @@ def run_test(test_id, main_py, requirements):
             log(rec["summary"])
             return
         env["DISPLAY"] = disp
-        cmd = [sys.executable, "__dawg_run.py"]
+        cmd = [py, "__dawg_run.py"]
     elif os.environ.get("DISPLAY"):
-        cmd = [sys.executable, "__dawg_run.py"]
+        cmd = [py, "__dawg_run.py"]
     else:
         rec["status"] = "skipped"
         rec["summary"] = "no display and no Xvfb available; self-test skipped (build still works)."
@@ -2416,8 +2555,10 @@ def run_test(test_id, main_py, requirements):
         log(rec["summary"])
         return
     except Exception as e:
-        rec["status"] = "fail"
-        rec["summary"] = "test run error: %s" % e
+        # The RUNNER itself fell over (bad interpreter, env quirk) -- that is NOT the app's
+        # fault, so don't report it as a failure that blocks a build. Mark it "couldn't run".
+        rec["status"] = "skipped"
+        rec["summary"] = "couldn't run the crash check here (%s) -- not an app fault; build isn't blocked." % e
         log(rec["summary"])
         return
     finally:
@@ -2730,7 +2871,18 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/keytest":
             return self._keytest()
         if path == "/api/doctor":
-            return self._send(200, {"checks": doctor(), "can_test": host_can_test()})
+            return self._send(200, {"checks": doctor(), "can_test": host_can_test(),
+                                    "testenv_ready": testenv_ready(),
+                                    "needs_provision": test_python() is None and host_can_display()})
+        if path == "/api/provlog":
+            qs = parse_qs(urlparse(self.path).query)
+            pid = (qs.get("id") or [""])[0]
+            rec = PROVISION.get(pid)
+            if not rec:
+                return self._send(404, {"error": "no such provision job"})
+            return self._send(200, {"status": rec["status"],
+                                    "log": "\n".join(rec["log"][-400:]),
+                                    "message": rec.get("message", "")})
         if path == "/api/templates":
             return self._send(200, {"templates": [
                 {"id": k, "label": v["label"], "desc": v["desc"], "kit": v.get("kit", True)}
@@ -2841,6 +2993,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_project_zip(body)
         if path == "/api/preview":
             return self.handle_preview(body)
+        if path == "/api/provision":
+            return self.handle_provision(body)
         if path == "/api/quit":
             self._send(200, {"bye": True})
             threading.Timer(0.4, lambda: os._exit(0)).start()
@@ -3050,11 +3204,36 @@ class H(BaseHTTPRequestHandler):
         error = body.get("error") or ""
         if not main_py.strip():
             return self._send(400, {"error": "no main_py to fix"})
+        source = "caller"
         if not error.strip():
-            # derive findings from analysis if the caller didn't pass an explicit error
             reqs = fix_requirements(body.get("requirements", ""))
-            issues = analyze_code(main_py, reqs, body.get("permissions", ""))
-            error = "\n".join("- " + it["msg"] for it in issues) or "no explicit error; review for robustness"
+            # 1) syntax first -- a parse error blocks everything else
+            sok, smsg = syntax_check(main_py)
+            if not sok:
+                error = "SYNTAX ERROR: " + smsg
+                source = "syntax"
+            else:
+                # 2) actually RUN it. This is the whole point of Auto-fix: v3 bailed here with
+                # "run Self-test first" and left the model guessing. If we can run the app, we
+                # run it now and hand back the real traceback -- so a click just works.
+                if host_can_test():
+                    t = _run_selftest_sync(main_py, reqs)
+                    if t.get("status") in ("fail", "timeout") and (t.get("error_text") or t.get("summary")):
+                        error = t.get("error_text") or t.get("summary")
+                        source = "selftest"
+                # 3) fall back to static findings only if we couldn't get a runtime error
+                if not error.strip():
+                    issues = analyze_code(main_py, reqs, body.get("permissions", ""))
+                    hard = [it for it in issues if it["sev"] in ("error", "warn")]
+                    error = "\n".join("- " + it["msg"] for it in hard)
+                    source = "static"
+            if not error.strip():
+                return self._send(200, {"ok": True, "unchanged": True, "no_fault": True,
+                                        "main_py": main_py,
+                                        "requirements": fix_requirements(body.get("requirements", "")),
+                                        "permissions": clean_perms(body.get("permissions", "")),
+                                        "summary": "nothing to fix -- it compiles, runs, and every "
+                                                   "button fired cleanly in the self-test."})
         try:
             attempt = int(body.get("attempt") or 0)
         except Exception:
@@ -3071,6 +3250,8 @@ class H(BaseHTTPRequestHandler):
                                     == strip_kit(main_py).strip())
         except Exception:
             payload["unchanged"] = False
+        payload["fix_source"] = source          # caller | syntax | selftest | static
+        payload["diagnosed_error"] = error[:2000]
         return self._send(200, payload)
 
     def handle_polish(self, body):
@@ -3096,6 +3277,26 @@ class H(BaseHTTPRequestHandler):
         threading.Thread(target=run_test, args=(tid, main_py, requirements), daemon=True).start()
         return self._send(200, {"test_id": tid})
 
+    def handle_provision(self, body):
+        """Set up the isolated crash-check environment in the background so the pre-build
+        self-test works on machines without desktop Kivy. Returns a prov_id to poll."""
+        if test_python() is not None:
+            return self._send(200, {"prov_id": None, "already": True,
+                                    "message": "the crash check already works on this machine."})
+        pid = uuid.uuid4().hex[:12]
+        PROVISION[pid] = {"log": [], "status": "running", "message": ""}
+
+        def _work():
+            rec = PROVISION[pid]
+            def log(m):
+                rec["log"].append(m)
+            ok, msg = provision_testenv(log=log)
+            rec["message"] = msg
+            rec["status"] = "done" if ok else "fail"
+            log(msg)
+        threading.Thread(target=_work, daemon=True).start()
+        return self._send(200, {"prov_id": pid})
+
     def handle_preview(self, body):
         """Launch the phone-frame desktop preview of the current app -- a live window sized
         like a real Android screen, so you SEE it before a 40-minute build. Fire-and-forget:
@@ -3107,9 +3308,10 @@ class H(BaseHTTPRequestHandler):
         sok, smsg = syntax_check(main_py)
         if not sok:
             return self._send(400, {"error": "fix the syntax error before previewing: " + smsg})
-        if not host_has_kivy():
-            return self._send(400, {"error": "the preview needs desktop Kivy. Install it once: "
-                                             "pip install --user kivy  (the APK build itself doesn't need it)."})
+        if test_python() is None:
+            return self._send(400, {"error": "the preview needs desktop Kivy. Click 'Enable crash "
+                                             "check' to set up an isolated one automatically, or "
+                                             "install it yourself: pip install --user kivy."})
         if not os.path.exists(_PREVIEW_PY):
             return self._send(400, {"error": "preview.py isn't installed next to apkforge.py -- re-run install.sh."})
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -3121,7 +3323,7 @@ class H(BaseHTTPRequestHandler):
                 f.write(main_py)
         except Exception as e:
             return self._send(500, {"error": "couldn't stage the preview: %s" % e})
-        cmd = [sys.executable, _PREVIEW_PY, os.path.join(pdir, "main.py")]
+        cmd = [test_python() or sys.executable, _PREVIEW_PY, os.path.join(pdir, "main.py")]
         if device:
             cmd += ["--device", device]
         # Never send the preview's output to /dev/null. When it died -- no display, missing
@@ -3297,6 +3499,30 @@ class H(BaseHTTPRequestHandler):
                 "(it points JAVA_HOME at a compatible JDK automatically once one is "
                 "installed)." % (jver, jhint)})
         project_dir = os.path.join(PROJECTS, name)
+        # HARD GATE: never spend ~20 minutes building an app that won't boot or whose buttons
+        # crash. If we can run it, we run it first and tap every button. A crasher is refused
+        # unless the caller explicitly overrides with force=true ("Build anyway").
+        force = bool(body.get("force"))
+        if not force:
+            if test_python() is None:
+                return self._send(409, {"error":
+                    "The crash check isn't set up, so this app hasn't been launched or tapped "
+                    "even once. Building blind risks 20 minutes for an app that won't boot. "
+                    "Enable the crash check first, or Build anyway.",
+                    "needs_provision": True, "gate": "no_crash_check"})
+            try:
+                t = _run_selftest_sync(main_py, requirements)
+            except Exception:
+                t = {"status": "skipped"}   # a broken checker must never block a real build
+            if t.get("status") in ("fail", "timeout"):
+                failed = [p["name"] for p in t.get("phases", []) if not p.get("ok")]
+                return self._send(409, {"error":
+                    "This app FAILED the crash check%s -- on a phone that's a broken/booting-"
+                    "crashing app. Hit Auto-fix, or Build anyway if you know better." %
+                    ((" at: " + ", ".join(failed)) if failed else ""),
+                    "gate": "crash_check_failed",
+                    "phases": t.get("phases", []),
+                    "error_text": t.get("error_text") or t.get("summary", "")})
         os.makedirs(project_dir, exist_ok=True)
         if body.get("clean"):
             shutil.rmtree(os.path.join(project_dir, ".buildozer"), ignore_errors=True)
@@ -3334,30 +3560,32 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>THE DAWG // APK FORGE</title>
+<title>THE DAWG // FORGE</title>
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <style>
   :root{
-    --bg:#070a0e; --bg2:#0a0f15; --panel:#0e141c; --panel2:#131b25; --panel3:#182231;
-    --line:#1e2a3a; --line2:#2a3a4f;
-    --txt:#e2ecf7; --muted:#7b8da0; --dim:#546274;
-    --green:#3ddc84; --cyan:#43c8f5; --violet:#8b7cf6;
+    --bg:#06090d; --bg2:#0a0e13; --panel:#0d131b; --panel2:#121a24; --panel3:#17212e;
+    --line:#1d2a39; --line2:#2a3b4f;
+    --txt:#e6eef7; --muted:#7f92a6; --dim:#556274;
+    /* Dawg identity: Android green leads, cyan + violet support */
+    --green:#3ddc84; --green2:#2fc373; --greenGlow:rgba(61,220,132,.55);
+    --cyan:#38cdf0; --violet:#9282f7;
     --danger:#ff5f6d; --amber:#ffb340;
     --r:12px; --r2:16px;
-    --sh:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+    --sh:0 1px 2px rgba(0,0,0,.45), 0 10px 30px -14px rgba(0,0,0,.75);
     --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"JetBrains Mono","DejaVu Sans Mono",monospace;
     --ui:system-ui,-apple-system,"Segoe UI",Inter,Roboto,"Helvetica Neue",sans-serif;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
   body{margin:0;background:
-      radial-gradient(1100px 620px at 78% -12%, rgba(67,200,245,.09), transparent 62%),
-      radial-gradient(900px 560px at 8% 4%, rgba(139,124,246,.08), transparent 60%),
+      radial-gradient(1100px 620px at 82% -14%, rgba(61,220,132,.10), transparent 60%),
+      radial-gradient(920px 560px at 6% 2%, rgba(56,205,240,.06), transparent 58%),
       var(--bg);
     color:var(--txt);font-family:var(--ui);font-size:14.5px;line-height:1.55;
     -webkit-font-smoothing:antialiased}
-  ::selection{background:rgba(67,200,245,.28)}
+  ::selection{background:rgba(61,220,132,.30)}
 
   /* ---------- scrollbars ---------- */
   ::-webkit-scrollbar{width:11px;height:11px}
@@ -3367,17 +3595,21 @@ INDEX_HTML = r"""<!doctype html>
 
   /* ---------- header ---------- */
   header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;
-    padding:12px 22px;border-bottom:1px solid var(--line);
-    background:rgba(8,12,17,.82);backdrop-filter:blur(14px) saturate(160%)}
-  .brand{display:flex;align-items:center;gap:11px;font-weight:650;letter-spacing:.4px;font-size:14.5px}
-  .logo{width:30px;height:30px;border-radius:9px;flex:0 0 auto;
-    background:linear-gradient(145deg,var(--cyan),var(--violet));
-    display:grid;place-items:center;color:#04080d;font-weight:800;font-size:14px;
-    box-shadow:0 0 0 1px rgba(67,200,245,.35),0 6px 18px -6px rgba(67,200,245,.55);
-    font-family:var(--mono)}
-  .brand em{font-style:normal;color:var(--cyan)}
-  .ver{font-size:10.5px;color:var(--dim);font-weight:500;letter-spacing:1px;
-    border:1px solid var(--line);padding:2px 7px;border-radius:20px;font-family:var(--mono)}
+    padding:11px 22px;border-bottom:1px solid var(--line);
+    background:rgba(6,9,13,.82);backdrop-filter:blur(16px) saturate(160%)}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.3px;font-size:15px}
+  .logo{width:34px;height:34px;border-radius:10px;flex:0 0 auto;object-fit:cover;
+    background:linear-gradient(150deg,#0f1a14,#0a0e13);
+    box-shadow:0 0 0 1px var(--greenGlow),0 6px 18px -6px var(--greenGlow);
+    padding:2px}
+  .brand .wm{display:flex;flex-direction:column;line-height:1.05}
+  .brand .wm b{font-size:15px;font-weight:800;letter-spacing:.5px}
+  .brand em{font-style:normal;color:var(--green)}
+  .brand .wm small{font-size:9.5px;letter-spacing:2.2px;color:var(--dim);font-weight:600;
+    text-transform:uppercase;margin-top:1px}
+  .ver{font-size:10.5px;color:var(--green);font-weight:600;letter-spacing:1px;
+    border:1px solid rgba(61,220,132,.32);background:rgba(61,220,132,.08);
+    padding:2px 8px;border-radius:20px;font-family:var(--mono)}
   .grow{margin-left:auto}
   .hdr-tools{display:flex;align-items:center;gap:8px}
 
@@ -3394,8 +3626,8 @@ INDEX_HTML = r"""<!doctype html>
     width:100%;background:var(--panel2);color:var(--txt);border:1px solid var(--line);
     border-radius:var(--r);padding:11px 13px;font-family:var(--ui);font-size:13.5px;
     outline:none;transition:border-color .15s, box-shadow .15s}
-  textarea:focus,input:focus,select:focus{border-color:var(--cyan);
-    box-shadow:0 0 0 3px rgba(67,200,245,.13)}
+  textarea:focus,input:focus,select:focus{border-color:var(--green);
+    box-shadow:0 0 0 3px rgba(61,220,132,.14)}
   textarea{resize:vertical}
   #desc{height:104px;font-size:14px;line-height:1.6}
   select{appearance:none;cursor:pointer;
@@ -3417,18 +3649,26 @@ INDEX_HTML = r"""<!doctype html>
   button:hover:not(:disabled){border-color:#3d5570;background:#1c2736;transform:translateY(-1px)}
   button:active:not(:disabled){transform:translateY(0)}
   button:disabled{opacity:.38;cursor:not-allowed}
-  button.primary{background:linear-gradient(180deg,#3ddc84,#2bb96b);border-color:#2bb96b;color:#04140b}
-  button.primary:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(61,220,132,.75);background:linear-gradient(180deg,#4ce792,#31c574)}
-  button.accent{background:linear-gradient(180deg,#43c8f5,#2ba7d4);border-color:#2ba7d4;color:#03151d}
-  button.accent:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(67,200,245,.75)}
-  button.violet{background:linear-gradient(180deg,#8b7cf6,#6f5fe0);border-color:#6f5fe0;color:#0b0720}
-  button.violet:hover:not(:disabled){box-shadow:0 6px 20px -8px rgba(139,124,246,.7)}
+  button.primary{background:linear-gradient(180deg,#3ddc84,#2fc373);border-color:#2fc373;color:#04140b}
+  button.primary:hover:not(:disabled){box-shadow:0 8px 24px -8px var(--greenGlow);background:linear-gradient(180deg,#4ee996,#35cf7c)}
+  button.accent{background:linear-gradient(180deg,#38cdf0,#25a9d0);border-color:#25a9d0;color:#03151d}
+  button.accent:hover:not(:disabled){box-shadow:0 8px 24px -8px rgba(56,205,240,.7)}
+  button.violet{background:linear-gradient(180deg,#9282f7,#7261e6);border-color:#7261e6;color:#0b0720}
+  button.violet:hover:not(:disabled){box-shadow:0 8px 24px -8px rgba(146,130,247,.7)}
   button.warn{background:#2a2010;border-color:#5d4820;color:var(--amber)}
   button.ghost{background:transparent}
   button.sm{padding:7px 12px;font-size:12px;border-radius:9px}
   .chip{padding:7px 13px;font-size:12.5px;border-radius:20px;font-weight:500;
     background:var(--panel2);border-color:var(--line)}
-  .chip:hover:not(:disabled){border-color:var(--cyan);color:var(--cyan)}
+  .chip:hover:not(:disabled){border-color:var(--green);color:var(--green)}
+
+  /* ---------- notice banner ---------- */
+  .notice{border:1px solid var(--line2);border-left:3px solid var(--amber);
+    background:linear-gradient(180deg,rgba(255,179,64,.08),transparent);
+    border-radius:var(--r);padding:11px 14px;margin-bottom:16px;font-size:13px;
+    color:var(--txt);display:flex;align-items:center;gap:8px;flex-wrap:wrap;line-height:1.5}
+  .notice.work{border-left-color:var(--green);background:linear-gradient(180deg,rgba(61,220,132,.08),transparent);color:var(--muted)}
+  .notice.bad{border-left-color:var(--danger);background:linear-gradient(180deg,rgba(255,95,109,.08),transparent)}
 
   /* ---------- tabs ---------- */
   .tabs{display:inline-flex;gap:4px;padding:4px;background:var(--panel);
@@ -3436,8 +3676,8 @@ INDEX_HTML = r"""<!doctype html>
   .tab{padding:8px 20px;border-radius:9px;color:var(--muted);cursor:pointer;
     font-weight:600;font-size:13px;transition:.15s;user-select:none;letter-spacing:.3px}
   .tab:hover{color:var(--txt)}
-  .tab.active{color:#04080d;background:linear-gradient(180deg,var(--cyan),#2ba7d4);
-    box-shadow:0 4px 14px -6px rgba(67,200,245,.8)}
+  .tab.active{color:#04140b;background:linear-gradient(180deg,var(--green),var(--green2));
+    box-shadow:0 4px 14px -6px var(--greenGlow)}
 
   /* ---------- status pills ---------- */
   .pills{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
@@ -3464,7 +3704,7 @@ INDEX_HTML = r"""<!doctype html>
   .editor{position:relative;border:1px solid var(--line);border-radius:var(--r);
     background:#070b10;overflow:hidden;display:flex;height:480px;min-height:180px;
     resize:vertical;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
-  .editor:focus-within{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(67,200,245,.11)}
+  .editor:focus-within{border-color:var(--green);box-shadow:0 0 0 3px rgba(61,220,132,.12)}
   .gutter{flex:0 0 auto;height:100%;padding:13px 10px 13px 14px;text-align:right;color:#39485c;
     font-family:var(--mono);font-size:12.5px;line-height:1.65;user-select:none;
     background:#080d13;border-right:1px solid var(--line);overflow:hidden;min-width:54px}
@@ -3544,7 +3784,7 @@ INDEX_HTML = r"""<!doctype html>
   /* ---------- toasts ---------- */
   #toasts{position:fixed;right:20px;bottom:20px;z-index:80;display:flex;
     flex-direction:column;gap:9px;align-items:flex-end}
-  .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--cyan);
+  .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--green);
     border-radius:11px;padding:11px 16px;font-size:13px;max-width:400px;
     box-shadow:0 14px 40px -14px rgba(0,0,0,.9);animation:tin .22s ease-out}
   .toast.ok{border-left-color:var(--green)}
@@ -3573,9 +3813,12 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="brand">
-    <div class="logo">D</div>
-    <span>THE DAWG <em>// APK FORGE</em></span>
-    <span class="ver">v3.0</span>
+    <img class="logo" src="/icon.png" alt="The Dawg">
+    <div class="wm">
+      <b>THE DAWG <em>// FORGE</em></b>
+      <small>describe an app &middot; get a real apk</small>
+    </div>
+    <span class="ver">v3.1</span>
   </div>
   <span class="grow"></span>
   <div class="hdr-tools">
@@ -3630,6 +3873,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- ============ Workspace ============ -->
   <div class="panel hidden" id="out">
+    <div class="notice hidden" id="crashbanner"></div>
     <div class="pills" id="meta" style="margin-bottom:16px"></div>
 
     <div class="grid4" style="margin-bottom:12px">
@@ -3679,7 +3923,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <div class="actions">
-      <button class="accent" id="buildBtn" onclick="buildApk()">Build APK</button>
+      <button class="accent" id="buildBtn" onclick="buildApk()" title="launches the app and taps every button first; refuses to build a crasher">Build APK</button>
       <button id="previewBtn" onclick="previewApp()" title="open the app in a phone-shaped window on your desktop -- no build needed">&#128241; Preview</button>
       <select id="previewDevice" title="preview device" style="max-width:180px"></select>
       <button id="testBtn" onclick="testRun()">Self-test</button>
@@ -3693,14 +3937,14 @@ INDEX_HTML = r"""<!doctype html>
   <!-- ============ Idle hint ============ -->
   <div class="panel" id="idle">
     <div class="empty">
-      <div class="big">&#9874;</div>
-      <div style="color:var(--muted);font-size:14.5px;margin-bottom:6px">Nothing forged yet</div>
-      <div style="max-width:520px;margin:0 auto">Describe an app above, or switch to
-        <b style="color:var(--cyan);cursor:pointer" onclick="setMode('manual')">MANUAL</b>
+      <img src="/icon.png" alt="" style="width:64px;height:64px;border-radius:16px;opacity:.9;margin-bottom:14px;box-shadow:0 0 0 1px var(--greenGlow),0 10px 30px -10px var(--greenGlow)">
+      <div style="color:var(--txt);font-size:16px;font-weight:700;margin-bottom:6px">Let the Dawg forge it</div>
+      <div style="max-width:520px;margin:0 auto;color:var(--muted)">Describe an app above, or switch to
+        <b style="color:var(--green);cursor:pointer" onclick="setMode('manual')">MANUAL</b>
         to write it yourself in an empty file.</div>
-      <div class="pills" style="justify-content:center;margin-top:18px">
-        <span class="pill info">every app is static-checked before it can build</span>
-        <span class="pill info">self-test taps every button before you burn 40 min</span>
+      <div class="pills" style="justify-content:center;margin-top:20px">
+        <span class="pill info">static-checked before it can build</span>
+        <span class="pill info">actually launched &amp; every button tapped</span>
         <span class="pill info">local repairs cost 0 tokens</span>
       </div>
     </div>
@@ -4087,29 +4331,72 @@ function pollJob(jid, done){
 var fixAttempt=0, fixLastErr='';
 async function autoFix(){
   if(!cur) return; collect();
-  var done=busy('fixBtn','fixing');
+  var done=busy('fixBtn','diagnosing');
   try{
-    var err=(cur.test_error||'')||
-      (cur.issues||[]).filter(function(i){return i.sev==='error'||i.sev==='warn';})
-        .map(function(i){return '- '+i.msg;}).join('\n');
-    if(!err.trim()){ toast('nothing to fix \u2014 run Self-test first','warn'); return; }
-    // asking again about the SAME error means the last answer didn't help: escalate so
-    // the server bypasses the response cache instead of replaying it
-    if(err===fixLastErr){ fixAttempt++; } else { fixAttempt=0; fixLastErr=err; }
+    // Hand the server whatever error we already have (an explicit self-test run leaves one
+    // in cur.test_error); if we have none, the server RUNS the app itself and fixes the real
+    // traceback. Auto-fix no longer makes you run the self-test first.
+    var err=(cur.test_error||'');
+    if(err && err===fixLastErr){ fixAttempt++; } else { fixAttempt=0; fixLastErr=err; }
     var r=await fetch('/api/fix',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({main_py:cur.main_py, requirements:cur.requirements,
                            permissions:cur.permissions, error:err, attempt:fixAttempt})});
     var d=await r.json();
-    if(!r.ok){ toast(d.error||'fix failed','bad'); return; }
+    if(!r.ok){
+      if(d.needs_provision){ offerCrashCheck(); return; }
+      toast(d.error||'fix failed','bad'); return;
+    }
+    if(d.no_fault){
+      toast('nothing to fix \u2014 it compiles, runs, and every button fired cleanly','ok');
+      return;
+    }
+    if(d.diagnosed_error){ fixLastErr=d.diagnosed_error; cur.test_error=d.diagnosed_error; }
     d.name=cur.name||d.name; d.title=cur.title||d.title;
     render(d);
+    var whence={selftest:'from a real test run', syntax:'a syntax error', static:'static analysis'}[d.fix_source]||'';
     if(d.unchanged){
       toast('the model returned the same code \u2014 click Auto-fix again to force a fresh attempt','warn');
     }else{
-      toast('fix applied \u2014 re-run the self-test','ok');
+      toast('fix applied'+(whence?(' ('+whence+')'):'')+' \u2014 re-run the self-test to confirm','ok');
     }
   }catch(e){ toast('network: '+e,'bad'); }
   finally{ done(); }
+}
+
+/* ---------------------------------------------------------------- crash-check setup */
+var PROV_BUSY=false;
+function offerCrashCheck(){
+  if(confirm('The pre-build crash check needs a desktop Kivy to run your app against, and '+
+             "there isn't one on this machine yet.\n\nSet up an isolated one now? It's a "+
+             'one-time ~25MB download and never touches your system packages.')){
+    enableCrashCheck();
+  }
+}
+async function enableCrashCheck(){
+  if(PROV_BUSY) return; PROV_BUSY=true;
+  var banner=$('crashbanner');
+  if(banner){ banner.className='notice work';
+    banner.innerHTML='<span class="spin"></span> setting up the crash check \u2014 downloading Kivy, one time...'; }
+  toast('setting up the crash-check environment (one time)...','ok');
+  try{
+    var r=await fetch('/api/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    var d=await r.json();
+    if(d.already){ PROV_BUSY=false; loadDoctor(); return; }
+    if(!d.prov_id){ PROV_BUSY=false; toast('couldn\u2019t start setup','bad'); return; }
+    var pt=setInterval(async function(){
+      try{
+        var s=await (await fetch('/api/provlog?id='+d.prov_id)).json();
+        if(banner){ var last=(s.log||'').split('\n').filter(Boolean).pop()||'working...';
+          banner.innerHTML='<span class="spin"></span> '+esc(last); }
+        if(s.status && s.status!=='running'){
+          clearInterval(pt); PROV_BUSY=false; loadDoctor();
+          if(s.status==='done'){ toast('crash check ready \u2014 self-test now runs on every check','ok'); }
+          else{ toast(s.message||'setup failed','bad');
+            if(banner){ banner.className='notice bad'; banner.innerHTML=esc(s.message||'setup failed'); } }
+        }
+      }catch(e){ clearInterval(pt); PROV_BUSY=false; }
+    }, 900);
+  }catch(e){ PROV_BUSY=false; toast('network: '+e,'bad'); }
 }
 
 async function localRepair(){
@@ -4216,21 +4503,44 @@ async function previewApp(){
 }
 
 /* ---------------------------------------------------------------- build */
-async function buildApk(){
+async function buildApk(force){
   if(!cur) return; collect();
   if(!(cur.main_py||'').trim()){ toast('nothing to build yet','warn'); return; }
-  if(cur.errors && cur.errors.length){
+  if(!force && cur.errors && cur.errors.length){
     if(!confirm(cur.errors.length+' blocking error(s) \u2014 the server will refuse this build.\n\n'+
       cur.errors.slice(0,4).join('\n')+'\n\nTry anyway?')) return;
   }
-  var done=busy('buildBtn','starting');
+  var done=busy('buildBtn', force?'starting':'crash-checking');
   hide('apkBtn');
   try{
+    var payload=Object.assign({}, cur); if(force) payload.force=true;
     var r=await fetch('/api/build',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(cur)});
+      body:JSON.stringify(payload)});
     var d=await r.json();
+    if(r.status===409){                 // the crash-check gate stopped us BEFORE wasting 20 min
+      done();
+      if(d.gate==='no_crash_check'){
+        if(confirm(d.error+'\n\nSet up the crash check now? (recommended, one-time ~25MB)')){
+          enableCrashCheck();
+        } else if(confirm('Build anyway, without ever launching the app?')){
+          buildApk(true);
+        }
+        return;
+      }
+      // crash_check_failed: show the phases + real error, offer Auto-fix or override
+      if(d.phases){ show('testpanel'); renderPhases(d.phases);
+        $('testout').textContent=d.error_text||d.error||''; }
+      if(d.error_text){ cur.test_error=d.error_text; }
+      $('out').scrollIntoView({behavior:'smooth',block:'nearest'});
+      if(confirm(d.error+'\n\nRun Auto-fix now instead of building a broken app?')){
+        autoFix();
+      } else if(confirm('Build the broken app anyway? It will take ~20 min and likely won\u2019t work right on the phone.')){
+        buildApk(true);
+      }
+      return;
+    }
     if(!r.ok){ toast(d.error||'build refused','bad'); done(); return; }
-    show('logwrap'); $('log').textContent='build started ('+d.build_id+')...\n';
+    show('logwrap'); $('log').textContent='crash check passed \u2014 build started ('+d.build_id+')...\n';
     $('logwrap').scrollIntoView({behavior:'smooth',block:'nearest'});
     pollBuild(d.build_id, done);
   }catch(e){ toast('network: '+e,'bad'); done(); }
@@ -4308,17 +4618,34 @@ async function loadDoctor(){
   try{
     var r=await fetch('/api/doctor'); var d=await r.json();
     var checks=d.checks||[];
-    $('doctor').innerHTML=checks.map(function(c){
+    var html=checks.map(function(c){
       return '<span class="pill '+(c[1]?'ok':'bad')+'"><span class="dot"></span>'+esc(c[0])+'</span>';
     }).join('')||'<span class="pill">no checks</span>';
+    // one-click crash-check setup lives right in the doctor when it isn't ready
+    if(d.needs_provision){
+      html+='<button class="sm primary" style="margin-top:8px" onclick="enableCrashCheck()">Enable crash check</button>';
+    }
+    $('doctor').innerHTML=html;
     var okN=checks.filter(function(c){return c[1];}).length;
     var bad=checks.length-okN;
     var sum=$('docsum');
     sum.className='pill '+(bad?'warn':'ok');
-    sum.innerHTML='<span class="dot"></span>environment <b>'+okN+'/'+checks.length+'</b>'+
-      (bad?' \u25BE':' \u25BE');
+    sum.innerHTML='<span class="dot"></span>environment <b>'+okN+'/'+checks.length+'</b> \u25BE';
     sum.title=bad? bad+' check(s) need attention \u2014 click for detail'
                  : 'everything the forge needs is installed';
+    // surface the single most important gap as a banner above the workspace
+    var banner=$('crashbanner');
+    if(banner && !PROV_BUSY){
+      if(d.needs_provision){
+        banner.className='notice';
+        banner.innerHTML='The pre-build crash check isn\u2019t set up, so apps are only static-checked '+
+          '\u2014 launch crashes won\u2019t be caught until they\u2019re on your phone. '+
+          '<button class="sm primary" onclick="enableCrashCheck()" style="margin-left:6px">Enable crash check</button>';
+        banner.classList.remove('hidden');
+      } else {
+        banner.classList.add('hidden');
+      }
+    }
   }catch(e){ $('docsum').innerHTML='<span class="dot"></span>doctor failed';
              $('docsum').className='pill bad'; }
 }

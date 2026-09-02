@@ -293,6 +293,7 @@ def run_http_pipeline():
 
     # pretend buildozer exists + mock the subprocess
     real_which = A.shutil.which
+    real_popen = A.subprocess.Popen
     A.shutil.which = lambda name: ("/usr/bin/buildozer" if name == "buildozer" else real_which(name))
     A.subprocess.Popen = FakePopen
 
@@ -314,7 +315,7 @@ def run_http_pipeline():
         # index
         s, b = http_bytes(base + "/")
         check("GET / 200", s == 200)
-        check("GET / has html", b'APK FORGE' in b)
+        check("GET / has html", b'THE DAWG' in b)
 
         # doctor
         s, d = http_json("GET", base + "/api/doctor")
@@ -336,8 +337,10 @@ def run_http_pipeline():
         check("forge syntax ok", d.get("syntax_ok") is True)
         payload = d
 
-        # build (real, mocked buildozer) -> should produce apk
-        s, d = http_json("POST", base + "/api/build", payload)
+        # build (real, mocked buildozer) -> should produce apk.
+        # force=true skips the crash-check gate: this test mocks subprocess.Popen for buildozer,
+        # so a real self-test can't run here -- the gate is covered separately in run_build_gate().
+        s, d = http_json("POST", base + "/api/build", dict(payload, force=True))
         check("build 200", s == 200 and "build_id" in d)
         bid = d.get("build_id")
 
@@ -447,6 +450,62 @@ def run_http_pipeline():
     finally:
         srv.shutdown()
         A.shutil.which = real_which
+        A.subprocess.Popen = real_popen
+
+
+def run_build_gate():
+    print("[4b] crash-check build gate (refuses a crasher before the 20-min build)")
+    real_which = A.shutil.which
+    real_java = A.java_version
+    real_popen = A.subprocess.Popen
+    import subprocess as _sp
+    A.subprocess.Popen = _sp.Popen   # the gate must run a REAL self-test, whatever ran before
+    # make the toolchain look present so requests reach the gate (which sits after those checks)
+    A.shutil.which = lambda name: ("/usr/bin/buildozer" if name == "buildozer" else real_which(name))
+    A.java_version = lambda: ("17.0.1", 17)
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), A.H)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    CRASH = ("from kivy.app import App\n"
+             "class CrashApp(App):\n"
+             "    def build(self):\n"
+             "        b=PillButton(text='go'); b.bind(on_release=self.go); return b\n"
+             "    def go(self,*a):\n"
+             "        self.x += 1\n"
+             "if __name__=='__main__':\n"
+             "    CrashApp().run()")
+    try:
+        crash_full = A.with_kit(CRASH)
+        good_full = A.with_kit(GOOD_APP)
+        if A.host_can_test():
+            # a crasher must be refused with a 409 gate, not sent to a 20-minute build
+            s, d = http_json("POST", base + "/api/build",
+                             {"name": "crashapp", "main_py": crash_full, "requirements": "python3,kivy"})
+            check("crasher refused by gate (409)", s == 409 and d.get("gate") == "crash_check_failed")
+            check("gate names the failing phase", "touch" in (d.get("error", "") + str(d.get("phases", ""))))
+            # force=true overrides the gate (proceeds past it to the real build)
+            s, d = http_json("POST", base + "/api/build",
+                             {"name": "crashapp", "main_py": crash_full, "requirements": "python3,kivy", "force": True})
+            check("force overrides gate", s == 200 and "build_id" in d)
+            # a genuinely good app passes the gate cleanly (no false positive)
+            s, d = http_json("POST", base + "/api/build",
+                             {"name": "okapp", "main_py": good_full, "requirements": "python3,kivy"})
+            check("good app passes gate", s == 200 and "build_id" in d)
+        else:
+            # no way to run apps here -> gate must warn (needs_provision), not build blind
+            s, d = http_json("POST", base + "/api/build",
+                             {"name": "crashapp", "main_py": crash_full, "requirements": "python3,kivy"})
+            check("no-crash-check warns (409)", s == 409 and d.get("gate") == "no_crash_check")
+            s, d = http_json("POST", base + "/api/build",
+                             {"name": "crashapp", "main_py": crash_full, "requirements": "python3,kivy", "force": True})
+            check("force builds without crash check", s == 200 and "build_id" in d)
+    finally:
+        srv.shutdown()
+        A.shutil.which = real_which
+        A.java_version = real_java
+        A.subprocess.Popen = real_popen
 
 
 def run_buildozer_missing_path():
@@ -630,7 +689,7 @@ def run_analysis_tests():
     cases = [
         ("Theme.NOPE",       "c = Card(); x = Theme.NOPE", "error", "Theme.NOPE"),
         ("bad kit kwarg",    "b = IconButton(glyph='+')",  "error", "glyph"),
-        ("undefined name",   "w = Chip(text='x')",         "error", "Chip"),
+        ("undefined name",   "w = Sparkle(text='x')",      "error", "Sparkle"),
         ("kv file",          "Builder.load_file('a.kv')",  "error", ".kv"),
         ("subprocess",       "import subprocess\nsubprocess.run(['ls'])", "error", "shell"),
         ("time.sleep",       "import time\ntime.sleep(5)", "warn",  "ANR"),
@@ -780,6 +839,7 @@ if __name__ == "__main__":
     run_spec_tests()
     hammer_parser(n)
     run_http_pipeline()
+    run_build_gate()
     run_buildozer_missing_path()
     run_v2_endpoints()
     run_kit_api_tests()
