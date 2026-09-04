@@ -64,6 +64,19 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
   replying in prose instead of code) instead of a toast that flashes and vanishes -- and your
   current app is left untouched so nothing is lost.
 
+## Self-sufficient install / auto Python (this build)
+- The installer now sets up the crash-check environment itself, and if the host Python is too
+  new for Kivy (Arch/CachyOS ship 3.14, which Kivy 2.3.1 has no wheels for), it **downloads a
+  self-contained CPython 3.12** from python-build-standalone -- no root, no AUR, no compiler --
+  and builds the isolated Kivy env from it. So Preview + the pre-build crash check work
+  straight after `install.sh` with zero manual Python juggling.
+- Same fallback drives the in-app "Enable crash check" button and `apkforge.py
+  --provision-testenv` (which install.sh calls). Verified end-to-end on a simulated 3.14-only
+  host: detects no compatible Python -> downloads 3.12.8 -> venv -> Kivy 2.3.1 -> ready.
+- Fixed the earlier bad advice: `sudo pacman -S python312` doesn't exist in Arch's official
+  repos; the messaging now points at the auto-download and, as a manual fallback,
+  `sudo pacman -S uv && uv python install 3.12`.
+
 ## Verified in this build
 - selftest.py: 338/338 PASS · selftest_modules.py: 54/54 PASS
 - Preview fix verified: correct message on Python 3.14 hosts, no-run apps, and hard-exit;

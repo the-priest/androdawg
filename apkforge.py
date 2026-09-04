@@ -1415,6 +1415,73 @@ def host_has_kivy():
 # APK sailed through. So we manage our own throwaway Kivy in a venv: provision once, and
 # the crash check works forever after, on any host, without touching system packages.
 TESTENV = os.path.join(os.path.expanduser("~"), ".androdawg", "testenv")
+PYDIR = os.path.join(os.path.expanduser("~"), ".androdawg", "python")
+
+# A self-contained CPython we can download when the host Python is too new for Kivy. These
+# are relocatable, no-root, no-compiler builds from astral's python-build-standalone. Pinned
+# so the URL is stable; 3.12.8 has Kivy 2.3.1 wheels and is rock-solid.
+_PYSA_TAG = "20250115"
+_PYSA_VER = "3.12.8"
+
+
+def _standalone_python_url():
+    """(url, filename) for this machine's arch, or (None, None) if unsupported."""
+    m = (os.uname().machine or "").lower()
+    if m in ("x86_64", "amd64"):
+        arch = "x86_64"
+    elif m in ("aarch64", "arm64"):
+        arch = "aarch64"
+    else:
+        return None, None
+    name = "cpython-%s+%s-%s-unknown-linux-gnu-install_only.tar.gz" % (_PYSA_VER, _PYSA_TAG, arch)
+    return ("https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s"
+            % (_PYSA_TAG, name)), name
+
+
+def _fetch_standalone_python(log=None):
+    """Download + unpack a self-contained CPython 3.12 into ~/.androdawg/python and return its
+    interpreter path. This is how the crash check works on a box whose only Python is too new
+    for Kivy (Arch/CachyOS ship 3.14). No root, no AUR, no compiler. Returns None on failure."""
+    def _say(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    dest_py = os.path.join(PYDIR, "python", "bin", "python3")
+    if os.path.exists(dest_py):
+        return dest_py
+    url, name = _standalone_python_url()
+    if not url:
+        _say("no prebuilt Python for this CPU (%s)." % (os.uname().machine,))
+        return None
+    try:
+        os.makedirs(PYDIR, exist_ok=True)
+    except Exception as e:
+        _say("couldn't create %s: %s" % (PYDIR, e))
+        return None
+    tgz = os.path.join(PYDIR, name)
+    _say("downloading a self-contained Python %s (~65MB, one time)..." % _PYSA_VER)
+    try:
+        with urllib.request.urlopen(url, timeout=600) as r, open(tgz, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except Exception as e:
+        _say("download failed: %s" % e)
+        return None
+    _say("unpacking Python...")
+    try:
+        import tarfile
+        with tarfile.open(tgz) as t:
+            t.extractall(PYDIR)
+    except Exception as e:
+        _say("unpack failed: %s" % e)
+        return None
+    finally:
+        try:
+            os.remove(tgz)
+        except Exception:
+            pass
+    return dest_py if os.path.exists(dest_py) else None
 
 
 def testenv_python():
@@ -1457,6 +1524,10 @@ def _compatible_python():
     v = sys.version_info
     if v.major == 3 and 9 <= v.minor <= 13:
         return sys.executable
+    # a standalone CPython we downloaded earlier
+    dl = os.path.join(PYDIR, "python", "bin", "python3")
+    if os.path.exists(dl):
+        return dl
     for name in ("python3.13", "python3.12", "python3.11", "python3.10"):
         p = shutil.which(name)
         if p:
@@ -1479,9 +1550,15 @@ def provision_testenv(log=None):
         return True, "the crash-check environment is already set up."
     base_py = _compatible_python()
     if not base_py:
-        return False, ("no Kivy-compatible Python found. Kivy 2.3.1 needs CPython 3.9-3.13, but "
-                       "this machine only has %s. Install one (e.g. Arch: sudo pacman -S python312) "
-                       "and try again." % ".".join(str(x) for x in sys.version_info[:3]))
+        # Host Python is too new for Kivy and there's no older one on PATH -- fetch a
+        # self-contained CPython so this still works with zero manual steps.
+        _say("no Kivy-compatible Python on this machine (host is %s) -- fetching one..."
+             % ".".join(str(x) for x in sys.version_info[:3]))
+        base_py = _fetch_standalone_python(log=_say)
+    if not base_py:
+        return False, ("couldn't get a Kivy-compatible Python. Kivy 2.3.1 needs CPython 3.9-3.13. "
+                       "Fastest fix on Arch/CachyOS:  sudo pacman -S uv && uv python install 3.12  "
+                       "(then re-run). Auto-download needs github.com reachable.")
     try:
         os.makedirs(os.path.dirname(TESTENV), exist_ok=True)
     except Exception as e:
@@ -4991,6 +5068,14 @@ def _post_quit(url):
 def main():
     global CONFIG
     CONFIG = load_config()
+    # install-time / manual hook: set up the crash-check environment (fetching a
+    # Kivy-compatible Python if the host is too new) and exit. Called by install.sh so a
+    # fresh machine is ready to test + preview without any manual Python juggling.
+    if "--provision-testenv" in sys.argv:
+        print("[dawg] setting up the crash-check environment...")
+        ok, msg = provision_testenv(log=lambda m: print("[dawg]   " + m))
+        print("[dawg] " + msg)
+        sys.exit(0 if ok else 1)
     # make sure user-site bin (where buildozer installs) is found, and allow pip to
     # install into an externally-managed env (Kali / PEP 668) during the build
     local_bin = os.path.expanduser("~/.local/bin")

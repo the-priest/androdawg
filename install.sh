@@ -177,13 +177,7 @@ PYBIN="$(command -v python3 || command -v python)"
 "$PYBIN" -m pip install --user --break-system-packages "cython==0.29.36" buildozer \
   || echo "[dawg]   ERROR: buildozer pip install failed"
 
-# 3b) host Kivy for the headless crash check (OPTIONAL - never fails the install).
-#     Pinned to 2.3.1 to match what the pre-build crash check runs against. If this is
-#     skipped, the app can still set up its own isolated Kivy later via "Enable crash check".
-echo "[dawg] (optional) installing host Kivy 2.3.1 for the crash check..."
-"$PYBIN" -m pip install --user --break-system-packages "kivy==2.3.1" >/dev/null 2>&1 \
-  && echo "[dawg]   host Kivy ready -> the crash check will launch your app and tap every button" \
-  || echo "[dawg]   host Kivy not installed (use 'Enable crash check' in-app to set up an isolated one)"
+# 3b) (crash-check environment is set up in step 4b, after the app files are in place)
 
 # 4) fetch app + sibling modules + icon from the local checkout, or GitHub as a fallback
 echo "[dawg] fetching app + modules + icon..."
@@ -205,6 +199,19 @@ if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/icon.png" ]; then
   cp "$SRC_DIR/icon.png" "$APP_DIR/icon.png"
 else
   curl -fsSL "$RAW/icon.png" -o "$APP_DIR/icon.png" || echo "[dawg]   WARN: could not download icon.png"
+fi
+
+# 4b) crash-check environment: the isolated Kivy that Preview and the pre-build crash check
+#     run your app against. If the host Python is too new for Kivy (Arch/CachyOS ship 3.14,
+#     which Kivy 2.3.1 has no wheels for), this downloads a self-contained CPython 3.12
+#     automatically -- no root, no AUR, no compiler. One-time (~90MB). Never fails the install.
+echo "[dawg] setting up the crash-check environment (makes Preview + the pre-build test work;"
+echo "[dawg]   may fetch a compatible Python automatically, one time)..."
+if "$PYBIN" "$APP_DIR/apkforge.py" --provision-testenv; then
+  :
+else
+  echo "[dawg]   crash-check setup didn't finish -- retry in-app via 'Enable crash check',"
+  echo "[dawg]   or on Arch/CachyOS:  sudo pacman -S uv && uv python install 3.12"
 fi
 
 # 5) launcher (pins JDK 17 if found, user-site on PATH, PEP 668 bypass)
