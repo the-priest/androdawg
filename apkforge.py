@@ -1430,21 +1430,45 @@ def testenv_python():
 
 
 def test_python():
-    """The interpreter used for the self-test: the managed venv first (isolated, known-good),
-    else the host interpreter if IT has kivy. None means no way to run the app here yet."""
+    """The interpreter used for the self-test/preview: the managed venv first (isolated,
+    known-good), else the host interpreter -- but only if it's a version Kivy supports
+    (3.9-3.13). A host on Python 3.14+ has 'kivy' importable yet its providers crash, so we
+    don't trust it; that falls through to None and the UI offers to build a compatible venv."""
     py = testenv_python()
     if py:
         return py
-    return sys.executable if host_has_kivy() else None
+    v = sys.version_info
+    if host_has_kivy() and v.major == 3 and 9 <= v.minor <= 13:
+        return sys.executable
+    return None
 
 
 def testenv_ready():
     return testenv_python() is not None
 
 
+def _compatible_python():
+    """An interpreter Kivy 2.3.1 actually has wheels for (CPython 3.9-3.13). The crash check
+    and preview run the app through this. Kivy 2.3.1 ships no wheels for 3.14+, so on a
+    bleeding-edge host (CachyOS/Arch default to the newest Python) its window/GL providers
+    fail to load -- which is why a preview can close instantly there. Prefer the current
+    interpreter when it qualifies, otherwise hunt PATH for a 3.13..3.10 to build the venv
+    against. Returns None if nothing suitable is found."""
+    v = sys.version_info
+    if v.major == 3 and 9 <= v.minor <= 13:
+        return sys.executable
+    for name in ("python3.13", "python3.12", "python3.11", "python3.10"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
 def provision_testenv(log=None):
     """Create the managed venv and install a desktop Kivy into it. Returns (ok, message).
-    Heavy (~25MB download) but one-time; everything after is instant. Safe to call twice."""
+    Heavy (~25MB download) but one-time; everything after is instant. Safe to call twice.
+    Built against a Kivy-compatible interpreter (3.9-3.13) so it works even when the host's
+    default Python is too new for Kivy."""
     def _say(m):
         if log:
             try:
@@ -1453,15 +1477,22 @@ def provision_testenv(log=None):
                 pass
     if testenv_ready():
         return True, "the crash-check environment is already set up."
+    base_py = _compatible_python()
+    if not base_py:
+        return False, ("no Kivy-compatible Python found. Kivy 2.3.1 needs CPython 3.9-3.13, but "
+                       "this machine only has %s. Install one (e.g. Arch: sudo pacman -S python312) "
+                       "and try again." % ".".join(str(x) for x in sys.version_info[:3]))
     try:
         os.makedirs(os.path.dirname(TESTENV), exist_ok=True)
     except Exception as e:
         return False, "couldn't create ~/.androdawg: %s" % e
     py = os.path.join(TESTENV, "bin", "python")
     if not os.path.exists(py):
-        _say("creating an isolated Python environment (one time)...")
+        vtag = subprocess.run([base_py, "-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
+                              capture_output=True, text=True).stdout.strip() or "?"
+        _say("creating an isolated Python %s environment (one time)..." % vtag)
         try:
-            subprocess.run([sys.executable, "-m", "venv", TESTENV],
+            subprocess.run([base_py, "-m", "venv", TESTENV],
                            capture_output=True, text=True, timeout=120, check=True)
         except Exception as e:
             return False, ("couldn't create the venv (%s). If your Python lacks venv, "
@@ -3922,6 +3953,22 @@ INDEX_HTML = r"""<!doctype html>
       <div class="log" id="testout" style="margin-top:12px"></div>
     </div>
 
+    <div class="sect" style="margin-top:22px"><h3>Improve with AI</h3><span class="line"></span></div>
+    <p class="hint" style="margin:-4px 0 12px">Keep talking to the AI to change this app &mdash; it sees the current code and edits it, it doesn't start over.</p>
+    <div class="row">
+      <input type="text" id="improveText" style="flex:1;min-width:240px"
+             placeholder="e.g. add a reset button, make the timer bigger, save history between launches"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();improve();}">
+      <button class="primary" id="improveBtn" onclick="improve()">Update with AI</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="chip" onclick="improveWith('Make it look more polished and modern: tighten layout, spacing and hierarchy')">&#9733; polish look</button>
+      <button class="chip" onclick="improveWith('Add a settings screen and persist preferences in user_data_dir')">&#9881;&#xFE0E; add settings</button>
+      <button class="chip" onclick="improveWith('Add a dark/light theme toggle that persists')">&#9681; theme toggle</button>
+      <button class="chip" onclick="improveWith('Add helpful animations and tap feedback throughout')">&#9834; add motion</button>
+    </div>
+    <div class="notice bad hidden" id="aiErr" style="margin-top:12px"></div>
+
     <div class="actions">
       <button class="accent" id="buildBtn" onclick="buildApk()" title="launches the app and taps every button first; refuses to build a crasher">Build APK</button>
       <button id="previewBtn" onclick="previewApp()" title="open the app in a phone-shaped window on your desktop -- no build needed">&#128241; Preview</button>
@@ -4254,6 +4301,45 @@ function refine(text){
   }
   $('desc').value=text;
   forge();
+}
+
+function showAiErr(msg){
+  var el=$('aiErr');
+  if(!el){ toast(msg,'bad'); return; }
+  el.className='notice bad'; el.textContent='AI: '+msg; el.classList.remove('hidden');
+}
+
+function improveWith(text){ $('improveText').value=text; improve(); }
+
+/* Talk to the AI to change the CURRENT app -- it gets the existing code as context and
+   edits it in place. This is the in-workspace iterate loop; it never starts from scratch. */
+async function improve(){
+  if(!cur){ toast('forge or write an app first','warn'); return; }
+  var text=($('improveText').value||'').trim();
+  if(!text){ $('improveText').focus(); return; }
+  collect();
+  var el=$('aiErr'); if(el) el.classList.add('hidden');
+  var done=busy('improveBtn','asking the AI');
+  turns.push(text);
+  try{
+    var r=await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({description:text,
+        history:turns.slice(0,-1).map(function(t){return {role:'user',content:t};}),
+        main_py:cur.main_py||''})});
+    var d=await r.json();
+    if(!r.ok || !d || !d.ok){
+      // Show WHY, and keep it on screen -- a follow-up that fails (bad key, provider down,
+      // the model replied in prose instead of code) must not just flash a toast and vanish.
+      var msg=(d&&d.error)||('the AI call failed ('+r.status+')');
+      showAiErr(msg + '  \u2014 your current app is unchanged; edit the wording and try again.');
+      return;
+    }
+    d.name=cur.name||d.name; d.title=cur.title||d.title;   // keep identity across edits
+    render(d);
+    $('improveText').value='';
+    toast('updated \u2014 re-run Self-test or Preview to check','ok');
+  }catch(e){ showAiErr('network error: '+e); }
+  finally{ done(); }
 }
 
 async function forge(){

@@ -53,11 +53,37 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
 - Crash-check status banner, "Enable crash check" action in the doctor, clearer build/fix
   toasts that tell you where a fix came from (real test run vs static analysis).
 
+## Improve-with-AI (this build)
+- You can now iterate on a forged app conversationally, from the workspace. Before, the only
+  way to change an app after the first forge was to scroll back up, wipe the "Describe the
+  app" box and re-forge -- which felt like starting over, so it looked like you couldn't talk
+  to the AI at all. There's now an **Improve with AI** box right above the build actions:
+  type what to change ("add a reset button", "save history between launches") and it edits the
+  CURRENT app in place (the model gets the existing code as context), plus quick chips.
+- Follow-up failures are now shown persistently (bad key, provider down, or the model
+  replying in prose instead of code) instead of a toast that flashes and vanishes -- and your
+  current app is left untouched so nothing is lost.
+
 ## Verified in this build
 - selftest.py: 338/338 PASS · selftest_modules.py: 54/54 PASS
+- Preview fix verified: correct message on Python 3.14 hosts, no-run apps, and hard-exit;
+  a good app still renders in the phone frame and exits 0
+- Managed crash-check env builds against a Kivy-compatible Python (proven end-to-end)
 - Every kit component (incl. new Scaffold/Row/Chip/Meter) instantiates headless under Kivy 2.3.1
-- Crash-check line remapping re-verified with the larger kit (points at the exact app line)
 - GUI: JS parses (node), HTML tags + CSS braces balanced, all handlers and DOM refs resolve
+
+## Preview / Python 3.14 fix (this build)
+- The preview no longer blames your code when Kivy can't start. Kivy 2.3.1 ships no wheels
+  for Python 3.14+, so on a bleeding-edge host (CachyOS/Arch default to the newest Python)
+  its window provider fails during import and hard-exits -- the old preview caught that
+  silently and printed "you never called run()". It now detects whether your source actually
+  calls run() and, when Kivy failed to start, says so plainly with the real cause and fix.
+- The crash-check environment now builds against a Kivy-compatible interpreter (CPython
+  3.9-3.13), searching PATH for python3.13..3.10 when the host default is too new. So on a
+  Python 3.14 box, "Enable crash check" sets up an isolated 3.12/3.13 env and Preview +
+  self-test work without downgrading your system Python.
+- test_python() no longer trusts a host interpreter on 3.14+ even if `kivy` imports there,
+  because its providers crash at runtime -- it falls through so the UI offers the fix.
 - GUI: JS parses (node), HTML tags + CSS braces balanced, all 25 handlers and 55 DOM refs resolve
 - Live: page + icon + all core endpoints return 200
 - Build gate live-tested: crasher refused, force overrides, clean app passes

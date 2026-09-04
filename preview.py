@@ -203,6 +203,44 @@ NO_RUN_MSG = (
     "                YourApp().run()")
 
 
+def _source_calls_run(mainpath):
+    """Does the source actually invoke <something>.run()? If it does but no window ever
+    opened, the fault is the environment/Kivy, NOT a missing run() -- so we must not tell
+    the user to add a line they already have."""
+    try:
+        src = open(mainpath, "r", encoding="utf-8", errors="replace").read()
+    except Exception:
+        return False
+    import re
+    return bool(re.search(r"\.run\s*\(", src))
+
+
+def _env_hint():
+    """Explain why Kivy couldn't open a window, with the two things that actually cause it."""
+    import platform
+    py = platform.python_version()
+    try:
+        import kivy
+        kv = kivy.__version__
+    except Exception:
+        kv = "?"
+    lines = [
+        "Kivy couldn't open a window on this machine -- this is an environment issue, not your app.",
+        "        Python %s / Kivy %s." % (py, kv),
+    ]
+    major_minor = tuple(int(x) for x in py.split(".")[:2])
+    if major_minor >= (3, 14):
+        lines.append("        Kivy 2.3.1 ships no wheels for Python %s, so its window/GL "
+                     "providers can fail to load here." % py)
+        lines.append("        Fix: run The Dawg on Python 3.11-3.13, e.g. install one and reinstall")
+        lines.append("        Kivy for it:  python3.12 -m pip install --user 'kivy==2.3.1'")
+    else:
+        lines.append("        Usually a display/driver issue: no DISPLAY, a headless session, or "
+                     "SDL2/GL libraries missing.")
+        lines.append("        On Wayland, try:  SDL_VIDEODRIVER=wayland  (or x11) before launching.")
+    return "\n        ".join(lines)
+
+
 def _inset_root(app):
     """Sit the app's content inside the phone's safe area.
 
@@ -305,16 +343,28 @@ def main(argv=None):
     _patch_run(prof, win_px, frame=not args.no_frame)
     try:
         runpy.run_path(mainpath, run_name="__main__")
-    except SystemExit:
-        pass
+    except SystemExit as se:
+        # Kivy hard-exits (sys.exit) when it can't load a window/GL provider. If that
+        # happened before the app's run loop started, it is an environment/Kivy failure --
+        # NOT a missing run() call. Say what actually went wrong.
+        if not RAN["started"]:
+            code = getattr(se, "code", None)
+            if code not in (0, None):
+                print("[preview] " + _env_hint())
+                return 1
+        # otherwise: a normal clean exit after the app ran
     except Exception as e:
         import traceback
         traceback.print_exc()
         print("[preview] app crashed: %s" % e)
         return 1
     if not RAN["started"]:
-        # no window ever opened -- say so instead of exiting 0 in silence
-        print("[preview] nothing opened: " + NO_RUN_MSG)
+        # No window opened. Distinguish "you never called run()" from "run() is there but
+        # Kivy couldn't start" -- otherwise we blame the user's code for an env problem.
+        if _source_calls_run(mainpath):
+            print("[preview] " + _env_hint())
+        else:
+            print("[preview] nothing opened: " + NO_RUN_MSG)
         return 1
     return 0
 
