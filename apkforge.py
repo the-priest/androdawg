@@ -1681,6 +1681,53 @@ def pkg_hint(pacman="", apt="", dnf="", zypper=""):
     return cmd
 
 
+# Every host command python-for-android shells out to while compiling the native recipes
+# (libffi/openssl/sdl2/python...). Missing any of these means a cryptic failure 10-20 minutes
+# into a build -- so we check them ALL up front and refuse instantly with the exact packages
+# to install. command -> (pacman, apt, dnf, zypper) package that provides it.
+_BUILD_TOOLS = {
+    "gcc":        ("base-devel", "build-essential", "gcc",          "gcc"),
+    "g++":        ("base-devel", "build-essential", "gcc-c++",      "gcc-c++"),
+    "make":       ("base-devel", "build-essential", "make",         "make"),
+    "ld":         ("base-devel", "binutils",        "binutils",     "binutils"),
+    "autoconf":   ("autoconf",   "autoconf",        "autoconf",     "autoconf"),
+    "automake":   ("automake",   "automake",        "automake",     "automake"),
+    "libtoolize": ("libtool",    "libtool",         "libtool",      "libtool"),
+    "pkg-config": ("pkgconf",    "pkg-config",      "pkgconf-pkg-config", "pkg-config"),
+    "cmake":      ("cmake",      "cmake",           "cmake",        "cmake"),
+    "git":        ("git",        "git",             "git",          "git"),
+    "zip":        ("zip",        "zip",             "zip",          "zip"),
+    "unzip":      ("unzip",      "unzip",           "unzip",        "unzip"),
+    "patch":      ("base-devel", "patch",           "patch",        "patch"),
+}
+
+
+def missing_build_tools():
+    """List of host commands p4a needs that aren't on PATH."""
+    return [cmd for cmd in _BUILD_TOOLS if shutil.which(cmd) is None]
+
+
+def build_tools_hint(missing):
+    """A single copy-pasteable install command covering all the missing build tools."""
+    pac, apt, dnf, zyp = set(), set(), set(), set()
+    for cmd in missing:
+        a, b, c, d = _BUILD_TOOLS[cmd]
+        pac.add(a); apt.add(b); dnf.add(c); zyp.add(d)
+    j = lambda s: " ".join(sorted(s))
+    return pkg_hint(pacman="sudo pacman -S --needed " + j(pac),
+                    apt="sudo apt install -y " + j(apt),
+                    dnf="sudo dnf install -y " + j(dnf),
+                    zypper="sudo zypper install " + j(zyp)) or ("install: " + j(pac))
+
+
+def free_gb(path):
+    """Free gigabytes on the filesystem holding `path` (best-effort; 0 on error)."""
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
 # xvfb-run is a Debian wrapper; Arch's xorg-server-xvfb ships only the Xvfb binary. We
 # treat EITHER as usable, and apkforge launches Xvfb itself when the wrapper is absent.
 def host_can_display():
@@ -1702,6 +1749,12 @@ def doctor():
     checks.append(["build env (isolated Python 3.12 + buildozer)",
                    build_env_ready() or _compatible_python() is not None
                    or os.path.exists(os.path.join(PYDIR, "python", "bin", "python3"))])
+    _miss = missing_build_tools()
+    checks.append(["build tools" + ("" if not _miss else " (missing: " + ", ".join(_miss) + ")"),
+                   not _miss])
+    _free = free_gb(os.path.expanduser("~"))
+    checks.append(["disk space%s" % ("" if _free >= 6 else " (%.1fGB free, want >=6)" % _free),
+                   _free >= 6])
     jver, jmaj = java_version()
     if jmaj is None:
         checks.append(["java (none) - install JDK 17", False])
@@ -2293,6 +2346,10 @@ def run_build(build_id, project_dir):
         except Exception:
             pass
         log("[dawg]   building with Python %s at %s (system Python left untouched)" % (bver, bpy))
+        _fg = free_gb(project_dir)
+        if _fg and _fg < 6:
+            log("[dawg]   WARNING: only %.1fGB free -- a first build needs ~5-6GB for the SDK/NDK "
+                "+ compile. Free some space if it fails partway." % _fg)
 
         # If a previous build used a different interpreter, its compiled recipes/venv won't
         # match. Wipe the per-arch build dir once so everything rebuilds cleanly. The big
@@ -2351,6 +2408,21 @@ def run_build(build_id, project_dir):
         else:
             rec["status"] = "failed"
             log("")
+            # Pull the most telling lines out of the log so the cause is obvious without
+            # scrolling thousands of lines.
+            sigs = ("Command failed", "error:", "ERROR:", "fatal error", "No such file",
+                    "not found", "Permission denied", "Traceback (most recent", "make: ***",
+                    "cannot find", "undefined reference", "Could not")
+            hits = [l for l in rec["log"] if any(s in l for s in sigs)]
+            # drop buildozer's own generic footer lines
+            hits = [l for l in hits if "raising an issue with buildozer" not in l
+                    and "The error might be hidden" not in l][-6:]
+            if hits:
+                rec["error_tail"] = "\n".join(hits)
+                log("---- most likely cause ----")
+                for l in hits:
+                    log(l)
+                log("---------------------------")
             log("buildozer exited with code %s (full log: %s)" % (proc.returncode, logpath))
     except FileNotFoundError:
         rec["status"] = "failed"
@@ -3710,6 +3782,13 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": "no Android-build-compatible Python (CPython 3.9-3.13) "
                                     "and none could be located to fetch one. Connect to the internet "
                                     "and retry, or on Arch/CachyOS: sudo pacman -S uv && uv python install 3.12"})
+        # Fast, up-front check of every host tool the native compile needs -- so a missing
+        # package fails in 2 seconds with the exact fix, not 20 minutes into the build.
+        miss = missing_build_tools()
+        if miss:
+            return self._send(400, {"error": "missing build tools: " + ", ".join(miss) +
+                                    ".\nInstall them, then retry:\n    " + build_tools_hint(miss),
+                                    "missing_tools": miss})
         jver, jmaj = java_version()
         if jmaj is not None and not (GRADLE_JDK_MIN <= jmaj <= GRADLE_JDK_MAX):
             jhint = pkg_hint(pacman="sudo pacman -S jdk17-openjdk",

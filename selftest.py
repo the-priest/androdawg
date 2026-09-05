@@ -295,6 +295,8 @@ def run_http_pipeline():
     real_which = A.shutil.which
     real_popen = A.subprocess.Popen
     real_ebe = A.ensure_build_env
+    real_mbt = A.missing_build_tools
+    A.missing_build_tools = lambda: []
     A.ensure_build_env = lambda log=None: (os.path.join(os.getcwd(), "_test_benv", "bin"),
                                            os.path.join(os.getcwd(), "_test_benv", "bin", "python"))
     A.shutil.which = lambda name: ("/usr/bin/buildozer" if name == "buildozer" else real_which(name))
@@ -455,6 +457,7 @@ def run_http_pipeline():
         A.shutil.which = real_which
         A.subprocess.Popen = real_popen
         A.ensure_build_env = real_ebe
+        A.missing_build_tools = real_mbt
 
 
 def run_build_gate():
@@ -463,6 +466,8 @@ def run_build_gate():
     real_java = A.java_version
     real_popen = A.subprocess.Popen
     real_ebe = A.ensure_build_env
+    real_mbt = A.missing_build_tools
+    A.missing_build_tools = lambda: []
     A.ensure_build_env = lambda log=None: (None, "test: build env stubbed")
     import subprocess as _sp
     A.subprocess.Popen = _sp.Popen   # the gate must run a REAL self-test, whatever ran before
@@ -513,6 +518,7 @@ def run_build_gate():
         A.java_version = real_java
         A.subprocess.Popen = real_popen
         A.ensure_build_env = real_ebe
+        A.missing_build_tools = real_mbt
 
 
 def run_buildozer_missing_path():

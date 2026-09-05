@@ -64,6 +64,24 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
   replying in prose instead of code) instead of a toast that flashes and vanishes -- and your
   current app is left untouched so nothing is lost.
 
+## Hardening pass -- fail fast, fail clear (this build)
+Goal: never wait 20-40 minutes to hit an error that could be caught in 2 seconds.
+- **Build-tool preflight.** Before a build starts, every host command p4a needs to compile the
+  native recipes is checked: gcc, g++, make, ld, autoconf, automake, libtoolize, pkg-config,
+  cmake, git, zip, unzip, patch. If any are missing the build is refused instantly with the
+  exact per-distro install command (pacman/apt/dnf/zypper) -- not a cryptic compile failure
+  deep in the log.
+- **Disk-space check.** Doctor flags < 6GB free, and the build logs a warning up front (a
+  first build needs ~5-6GB for SDK/NDK + compile).
+- **Self-diagnosing failures.** If buildozer exits non-zero, the most telling lines (Command
+  failed / error: / No such file / make: *** / Traceback ...) are pulled out and shown under
+  "most likely cause", so you don't scroll thousands of lines.
+- **Verified the whole dependency chain end-to-end:** standalone 3.12 -> buildozer 1.6.0 runs
+  -> its `pip install --user <p4a deps>` succeeds -> those deps import back under the same
+  interpreter (user site on sys.path). That was the last unproven link.
+- Doctor now surfaces: crash-check env, build env, build tools (with the missing ones named),
+  disk space, JDK version, and the SDK/NDK cache.
+
 ## Isolated build Python -- the real APK-build fix (this build)
 - The whole Android build (buildozer -> python-for-android) used to run under the system
   Python. On Arch/CachyOS that's 3.14, and p4a's build venv crashed with
