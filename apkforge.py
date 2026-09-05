@@ -1594,6 +1594,77 @@ def provision_testenv(log=None):
     return True, "crash-check environment ready -- the self-test will now run on every check."
 
 
+# ------------------------------------------------------------- isolated build environment
+# The Android build (buildozer -> python-for-android) runs the host Python. On Arch/CachyOS
+# that's 3.14, which p4a's build venv chokes on (broken pip: "cannot import name
+# BuildDependencyInstallError") and which p4a would even try to build FOR Android. So we run
+# the whole build through an isolated CPython 3.12 venv with buildozer + cython, and prefix
+# PATH with its bin/ so every bare `python`/`pip`/`cython` p4a shells out to is 3.12 too.
+BUILDENV = os.path.join(os.path.expanduser("~"), ".androdawg", "buildenv")
+
+
+def build_env_python():
+    py = os.path.join(BUILDENV, "bin", "python")
+    return py if os.path.exists(py) else None
+
+
+def build_env_ready():
+    py = build_env_python()
+    if not py:
+        return False
+    try:
+        return subprocess.run([py, "-c", "import buildozer, Cython"],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_build_env(log=None):
+    """Return (bindir, python_path) for an isolated 3.12 venv that has buildozer + cython,
+    creating it (and fetching a compatible Python if the host is too new) on first use.
+    Returns (None, error_message) on failure."""
+    def _say(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    py = build_env_python()
+    if not py:
+        base = _compatible_python()
+        if not base:
+            _say("host Python is too new for the Android toolchain -- fetching a compatible one...")
+            base = _fetch_standalone_python(log=log)
+        if not base:
+            return None, ("no Android-build-compatible Python (need CPython 3.9-3.13) and couldn't "
+                          "fetch one. On Arch/CachyOS: sudo pacman -S uv && uv python install 3.12")
+        try:
+            os.makedirs(os.path.dirname(BUILDENV), exist_ok=True)
+            _say("creating the isolated build environment (one time)...")
+            subprocess.run([base, "-m", "venv", BUILDENV],
+                           capture_output=True, text=True, timeout=180, check=True)
+        except Exception as e:
+            return None, "couldn't create the build venv: %s" % e
+        py = build_env_python()
+    if not build_env_ready():
+        _say("installing buildozer + cython into the isolated build env (one time)...")
+        try:
+            subprocess.run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
+                           capture_output=True, text=True, timeout=300)
+            r = subprocess.run([py, "-m", "pip", "install", "buildozer", "cython"],
+                               capture_output=True, text=True, timeout=1200)
+            if r.returncode != 0:
+                return None, "pip couldn't install buildozer/cython:\n" + (r.stderr or r.stdout or "")[-600:]
+        except subprocess.TimeoutExpired:
+            return None, "installing buildozer/cython timed out; check the network and retry."
+        except Exception as e:
+            return None, "installing buildozer/cython failed: %s" % e
+    if not build_env_ready():
+        return None, "buildozer/cython installed but won't import in the build venv."
+    _say("build environment ready.")
+    return os.path.join(BUILDENV, "bin"), py
+
+
 # ------------------------------------------------------------- distro-aware install hints
 def _pkg_manager():
     """Best-effort detection of the system package manager, for actionable error hints."""
@@ -1630,7 +1701,9 @@ def host_can_test():
 def doctor():
     """Toolchain self-diagnosis so failures are seen before a build is started."""
     checks = []
-    checks.append(["buildozer", shutil.which("buildozer") is not None])
+    checks.append(["build env (isolated Python 3.12 + buildozer)",
+                   build_env_ready() or _compatible_python() is not None
+                   or os.path.exists(os.path.join(PYDIR, "python", "bin", "python3"))])
     jver, jmaj = java_version()
     if jmaj is None:
         checks.append(["java (none) - install JDK 17", False])
@@ -2208,10 +2281,50 @@ def run_build(build_id, project_dir):
     log("full log saved to: " + logpath)
     log("")
     try:
+        # Build through the isolated 3.12 environment, never the (possibly too-new) system Python.
+        log("[dawg] preparing the isolated build environment (Python 3.12, buildozer, cython)...")
+        bindir, bpy = ensure_build_env(log=lambda m: log("[dawg]   " + m))
+        if not bindir:
+            rec["status"] = "failed"
+            log("ERROR: " + (bpy or "couldn't set up the build environment"))
+            return
+        bver = "?"
+        try:
+            bver = subprocess.run([bpy, "-c", "import sys;print('%d.%d.%d'%sys.version_info[:3])"],
+                                  capture_output=True, text=True, timeout=30).stdout.strip() or "?"
+        except Exception:
+            pass
+        log("[dawg]   building with Python %s at %s (system Python left untouched)" % (bver, bpy))
+
+        # If a previous build used a different interpreter, its compiled recipes/venv won't
+        # match. Wipe the per-arch build dir once so everything rebuilds cleanly. The big
+        # SDK/NDK caches live in ~/.buildozer and are NOT touched -- no multi-GB re-download.
+        marker = os.path.join(project_dir, ".buildozer", ".dawg_build_python")
+        prev = ""
+        try:
+            prev = open(marker).read().strip()
+        except Exception:
+            pass
+        if prev != bpy:
+            plat = os.path.join(project_dir, ".buildozer", "android", "platform")
+            for d in glob.glob(os.path.join(plat, "build-*")):
+                log("[dawg]   build interpreter changed -> clearing stale build dir for a clean rebuild")
+                shutil.rmtree(d, ignore_errors=True)
+            try:
+                os.makedirs(os.path.dirname(marker), exist_ok=True)
+                open(marker, "w").write(bpy)
+            except Exception:
+                pass
+
         env = dict(os.environ, BUILDOZER_WARN_ON_ROOT="0", PYTHONUNBUFFERED="1",
                    PIP_BREAK_SYSTEM_PACKAGES="1")
+        # Put the isolated env first so buildozer AND every bare python/pip/cython that p4a
+        # shells out to resolve to 3.12 -- this is what fixes the 3.14 build-venv pip crash.
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+        env.pop("VIRTUAL_ENV", None)
+        buildozer_bin = os.path.join(bindir, "buildozer")
         proc = subprocess.Popen(
-            ["buildozer", "-v", "android", "debug"],
+            [buildozer_bin, "-v", "android", "debug"],
             cwd=project_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -3592,8 +3705,13 @@ class H(BaseHTTPRequestHandler):
         errors, _ = validate_code(main_py, requirements)
         if errors:
             return self._send(400, {"error": "won't build: " + "; ".join(errors)})
-        if shutil.which("buildozer") is None:
-            return self._send(400, {"error": "buildozer not found on PATH. Run install.sh (or `pip install buildozer cython`), then retry."})
+        # The build runs through the isolated 3.12 env (set up on demand). Only block here if
+        # there's no way to get one at all -- no compatible Python and nothing on PATH to fetch/build with.
+        if not build_env_ready() and _compatible_python() is None and not os.path.exists(
+                os.path.join(PYDIR, "python", "bin", "python3")):
+            return self._send(400, {"error": "no Android-build-compatible Python (CPython 3.9-3.13) "
+                                    "and none could be located to fetch one. Connect to the internet "
+                                    "and retry, or on Arch/CachyOS: sudo pacman -S uv && uv python install 3.12"})
         jver, jmaj = java_version()
         if jmaj is not None and not (GRADLE_JDK_MIN <= jmaj <= GRADLE_JDK_MAX):
             jhint = pkg_hint(pacman="sudo pacman -S jdk17-openjdk",
@@ -5075,6 +5193,13 @@ def main():
         print("[dawg] setting up the crash-check environment...")
         ok, msg = provision_testenv(log=lambda m: print("[dawg]   " + m))
         print("[dawg] " + msg)
+        print("[dawg] setting up the isolated Android build environment...")
+        bindir, m2 = ensure_build_env(log=lambda m: print("[dawg]   " + m))
+        if bindir:
+            print("[dawg] build environment ready (isolated Python 3.12 + buildozer + cython)")
+        else:
+            print("[dawg] build env not ready: " + str(m2))
+            ok = False
         sys.exit(0 if ok else 1)
     # make sure user-site bin (where buildozer installs) is found, and allow pip to
     # install into an externally-managed env (Kali / PEP 668) during the build

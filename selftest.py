@@ -294,6 +294,9 @@ def run_http_pipeline():
     # pretend buildozer exists + mock the subprocess
     real_which = A.shutil.which
     real_popen = A.subprocess.Popen
+    real_ebe = A.ensure_build_env
+    A.ensure_build_env = lambda log=None: (os.path.join(os.getcwd(), "_test_benv", "bin"),
+                                           os.path.join(os.getcwd(), "_test_benv", "bin", "python"))
     A.shutil.which = lambda name: ("/usr/bin/buildozer" if name == "buildozer" else real_which(name))
     A.subprocess.Popen = FakePopen
 
@@ -451,6 +454,7 @@ def run_http_pipeline():
         srv.shutdown()
         A.shutil.which = real_which
         A.subprocess.Popen = real_popen
+        A.ensure_build_env = real_ebe
 
 
 def run_build_gate():
@@ -458,6 +462,8 @@ def run_build_gate():
     real_which = A.shutil.which
     real_java = A.java_version
     real_popen = A.subprocess.Popen
+    real_ebe = A.ensure_build_env
+    A.ensure_build_env = lambda log=None: (None, "test: build env stubbed")
     import subprocess as _sp
     A.subprocess.Popen = _sp.Popen   # the gate must run a REAL self-test, whatever ran before
     # make the toolchain look present so requests reach the gate (which sits after those checks)
@@ -506,12 +512,18 @@ def run_build_gate():
         A.shutil.which = real_which
         A.java_version = real_java
         A.subprocess.Popen = real_popen
+        A.ensure_build_env = real_ebe
 
 
 def run_buildozer_missing_path():
-    print("[4] buildozer-missing path (preflight refuses cleanly)")
-    real_which = A.shutil.which
-    A.shutil.which = lambda name: None  # nothing on PATH
+    print("[4] no-compatible-Python path (preflight refuses cleanly)")
+    real_cp = A._compatible_python
+    real_be = A.build_env_ready
+    real_pydir = A.PYDIR
+    # simulate: host Python too new, none on PATH, nothing fetched yet
+    A._compatible_python = lambda: None
+    A.build_env_ready = lambda: False
+    A.PYDIR = os.path.join(os.getcwd(), "_test_nopy")
     from http.server import ThreadingHTTPServer
     srv = ThreadingHTTPServer(("127.0.0.1", 0), A.H)
     port = srv.server_address[1]
@@ -521,11 +533,14 @@ def run_buildozer_missing_path():
     try:
         payload = A.build_forge_payload(
             "<<<MAIN_PY>>>\n" + GOOD_APP + "<<<END>>>", "x")
-        s, d = http_json("POST", base + "/api/build", payload)
-        check("no-buildozer refused 400", s == 400 and "buildozer not found" in d.get("error", ""))
+        s, d = http_json("POST", base + "/api/build", dict(payload, force=True))
+        check("no-compatible-python refused 400",
+              s == 400 and "compatible Python" in d.get("error", ""))
     finally:
         srv.shutdown()
-        A.shutil.which = real_which
+        A._compatible_python = real_cp
+        A.build_env_ready = real_be
+        A.PYDIR = real_pydir
 
 
 

@@ -64,6 +64,22 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
   replying in prose instead of code) instead of a toast that flashes and vanishes -- and your
   current app is left untouched so nothing is lost.
 
+## Isolated build Python -- the real APK-build fix (this build)
+- The whole Android build (buildozer -> python-for-android) used to run under the system
+  Python. On Arch/CachyOS that's 3.14, and p4a's build venv crashed with
+  "cannot import name BuildDependencyInstallError from pip._internal" -- and p4a was even
+  downloading CPython 3.14 to build FOR Android (unsupported). Builds now run through an
+  **isolated CPython 3.12 venv** (~/.androdawg/buildenv) that has buildozer + cython, with
+  PATH prefixed so every bare python/pip/cython p4a shells out to is 3.12 too. Your system
+  Python is never touched.
+- If a project was previously built under a different interpreter, the per-arch build dir is
+  cleared once for a clean rebuild (the multi-GB SDK/NDK caches in ~/.buildozer are kept).
+- The build env is created on demand and by install.sh (it now provisions BOTH the crash-check
+  and build environments, fetching a compatible Python automatically if the host is too new).
+- Verified: buildozer 1.6.0 runs under the isolated Python 3.12, and the exact step that
+  crashed on 3.14 (`python -m venv` + `pip install -U pip`) now succeeds. Preflight/doctor no
+  longer require a system buildozer.
+
 ## Self-sufficient install / auto Python (this build)
 - The installer now sets up the crash-check environment itself, and if the host Python is too
   new for Kivy (Arch/CachyOS ship 3.14, which Kivy 2.3.1 has no wheels for), it **downloads a
