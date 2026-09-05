@@ -69,16 +69,17 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
   Python. On Arch/CachyOS that's 3.14, and p4a's build venv crashed with
   "cannot import name BuildDependencyInstallError from pip._internal" -- and p4a was even
   downloading CPython 3.14 to build FOR Android (unsupported). Builds now run through an
-  **isolated CPython 3.12 venv** (~/.androdawg/buildenv) that has buildozer + cython, with
-  PATH prefixed so every bare python/pip/cython p4a shells out to is 3.12 too. Your system
-  Python is never touched.
+  isolated CPython 3.12 with PATH prefixed so every bare python/pip/cython p4a shells out to
+  is 3.12 too. Your system Python is never touched.
+- That interpreter is the standalone CPython's OWN prefix (~/.androdawg/python), NOT a venv:
+  buildozer hardcodes `pip install --user` for p4a's deps, and pip refuses `--user` inside a
+  venv ("User site-packages are not visible in this virtualenv"). A standalone prefix has a
+  normal user site, so --user works. (It's the same interpreter the crash check already
+  fetched, so there's usually nothing new to download.)
 - If a project was previously built under a different interpreter, the per-arch build dir is
   cleared once for a clean rebuild (the multi-GB SDK/NDK caches in ~/.buildozer are kept).
-- The build env is created on demand and by install.sh (it now provisions BOTH the crash-check
-  and build environments, fetching a compatible Python automatically if the host is too new).
-- Verified: buildozer 1.6.0 runs under the isolated Python 3.12, and the exact step that
-  crashed on 3.14 (`python -m venv` + `pip install -U pip`) now succeeds. Preflight/doctor no
-  longer require a system buildozer.
+- Verified: buildozer 1.6.0 runs on the isolated 3.12, cython is on its bin dir, and both
+  the earlier venv-pip crash AND buildozer's `pip install --user <p4a deps>` step now succeed.
 
 ## Self-sufficient install / auto Python (this build)
 - The installer now sets up the crash-check environment itself, and if the host Python is too

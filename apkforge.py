@@ -1596,15 +1596,21 @@ def provision_testenv(log=None):
 
 # ------------------------------------------------------------- isolated build environment
 # The Android build (buildozer -> python-for-android) runs the host Python. On Arch/CachyOS
-# that's 3.14, which p4a's build venv chokes on (broken pip: "cannot import name
-# BuildDependencyInstallError") and which p4a would even try to build FOR Android. So we run
-# the whole build through an isolated CPython 3.12 venv with buildozer + cython, and prefix
-# PATH with its bin/ so every bare `python`/`pip`/`cython` p4a shells out to is 3.12 too.
-BUILDENV = os.path.join(os.path.expanduser("~"), ".androdawg", "buildenv")
+# that's 3.14, which p4a's build venv chokes on and which p4a would even build FOR Android.
+# So we run the whole build through an isolated CPython 3.12 and prefix PATH with its bin/ so
+# every bare python/pip/cython p4a shells out to is 3.12 too.
+#
+# IMPORTANT: it must be the interpreter's OWN prefix, NOT a venv. buildozer hardcodes
+# `pip install --user` for p4a's deps, and pip refuses `--user` inside a venv
+# ("User site-packages are not visible in this virtualenv"). A standalone CPython prefix has
+# a normal user site, so --user works. That standalone is the same one the crash check
+# fetched (~/.androdawg/python), so there's usually nothing new to download.
+BUILDENV = os.path.join(os.path.expanduser("~"), ".androdawg", "buildenv")  # legacy; unused
 
 
 def build_env_python():
-    py = os.path.join(BUILDENV, "bin", "python")
+    """The isolated build interpreter: the standalone CPython's own prefix (not a venv)."""
+    py = os.path.join(PYDIR, "python", "bin", "python3")
     return py if os.path.exists(py) else None
 
 
@@ -1620,8 +1626,8 @@ def build_env_ready():
 
 
 def ensure_build_env(log=None):
-    """Return (bindir, python_path) for an isolated 3.12 venv that has buildozer + cython,
-    creating it (and fetching a compatible Python if the host is too new) on first use.
+    """Return (bindir, python_path) for an isolated CPython 3.12 (own prefix, not a venv) that
+    has buildozer + cython, fetching the interpreter and installing the tools on first use.
     Returns (None, error_message) on failure."""
     def _say(m):
         if log:
@@ -1631,23 +1637,15 @@ def ensure_build_env(log=None):
                 pass
     py = build_env_python()
     if not py:
-        base = _compatible_python()
-        if not base:
-            _say("host Python is too new for the Android toolchain -- fetching a compatible one...")
-            base = _fetch_standalone_python(log=log)
-        if not base:
-            return None, ("no Android-build-compatible Python (need CPython 3.9-3.13) and couldn't "
-                          "fetch one. On Arch/CachyOS: sudo pacman -S uv && uv python install 3.12")
-        try:
-            os.makedirs(os.path.dirname(BUILDENV), exist_ok=True)
-            _say("creating the isolated build environment (one time)...")
-            subprocess.run([base, "-m", "venv", BUILDENV],
-                           capture_output=True, text=True, timeout=180, check=True)
-        except Exception as e:
-            return None, "couldn't create the build venv: %s" % e
-        py = build_env_python()
+        _say("fetching an isolated Python for the Android build (one time)...")
+        py = _fetch_standalone_python(log=log)
+    if not py:
+        return None, ("no Android-build-compatible Python (need CPython 3.9-3.13) and couldn't "
+                      "fetch one. Connect to the internet and retry, or on Arch/CachyOS: "
+                      "sudo pacman -S uv && uv python install 3.12")
+    bindir = os.path.dirname(py)
     if not build_env_ready():
-        _say("installing buildozer + cython into the isolated build env (one time)...")
+        _say("installing buildozer + cython into the isolated build Python (one time)...")
         try:
             subprocess.run([py, "-m", "pip", "install", "--upgrade", "pip", "wheel", "setuptools"],
                            capture_output=True, text=True, timeout=300)
@@ -1660,9 +1658,9 @@ def ensure_build_env(log=None):
         except Exception as e:
             return None, "installing buildozer/cython failed: %s" % e
     if not build_env_ready():
-        return None, "buildozer/cython installed but won't import in the build venv."
+        return None, "buildozer/cython installed but won't import in the build Python."
     _say("build environment ready.")
-    return os.path.join(BUILDENV, "bin"), py
+    return bindir, py
 
 
 # ------------------------------------------------------------- distro-aware install hints
