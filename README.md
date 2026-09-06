@@ -1,196 +1,55 @@
-<div align="center">
+<p align="center">
+  <img src="icon.png" alt="AndroDawg" width="132" height="132">
+</p>
 
-<img src="icon.png" width="120" alt="The Dawg">
+<h1 align="center">AndroDawg</h1>
 
-# THE DAWG // APK FORGE
+<p align="center">
+  <b>Describe an Android app in plain English. Watch it get forged, crash-tested, and fixed — then built into a real APK.</b>
+</p>
 
-### Describe an Android app. Get a real `.apk`.
+<p align="center">
+  <img alt="platform" src="https://img.shields.io/badge/Linux-CachyOS%20%C2%B7%20Arch%20%C2%B7%20Debian%20%C2%B7%20Fedora%20%C2%B7%20SUSE-1793d1?style=flat-square&logo=linux&logoColor=white">
+  <img alt="python" src="https://img.shields.io/badge/Python-3.10%2B%20(host)-e8a33d?style=flat-square&logo=python&logoColor=white">
+  <img alt="ui" src="https://img.shields.io/badge/Builds-Kivy%20%2B%20Buildozer-9fe04a?style=flat-square">
+  <img alt="output" src="https://img.shields.io/badge/Output-.apk-46c7d4?style=flat-square&logo=android&logoColor=white">
+  <img alt="license" src="https://img.shields.io/badge/License-MIT-c79be0?style=flat-square">
+</p>
 
-A local AI app-smith. It forges a polished single-file Kivy app, tears it apart looking for
-the reasons Android apps fail to launch, **actually runs it and taps every button**, fixes
-what it finds — then compiles a real APK with Buildozer.
+<p align="center">
+  <i>AndroDawg is TheDawg's Android sibling: it forges phone apps and builds installable APKs, all locally.</i>
+</p>
 
-No cloud IDE. No Android Studio. Your machine, your key, your APK.
+---
+
+AndroDawg turns a one-line description into a working **Android app**, then does the part
+that usually wastes your afternoon for you: it **actually launches the app on a hidden
+display, taps every button, rotates it and lets it soak** — catching the crashes that only
+show up at runtime — and only then builds the `.apk`. When the model makes a mistake, it
+feeds the real traceback back and fixes it, before you ever spend 40 minutes on a build.
+
+Everything runs **locally**. Your API key never leaves your machine.
 
 <br>
-
-![version](https://img.shields.io/badge/version-3.0-3ddc84?style=for-the-badge)
-![python](https://img.shields.io/badge/python-3.8+-43c8f5?style=for-the-badge)
-![server](https://img.shields.io/badge/server-stdlib_only-8b7cf6?style=for-the-badge)
-![tests](https://img.shields.io/badge/selftest-334_passing-3ddc84?style=for-the-badge)
-![license](https://img.shields.io/badge/license-MIT-546274?style=for-the-badge)
-
-</div>
-
-<br>
-
-```
-  "a dark pomodoro timer with a countdown ring"
-                    │
-                    ▼
-   FORGE ──▶ REPAIR ──▶ LINT ──▶ SELF-TEST ──▶ BUILD ──▶  your-app.apk
-     │        0 tok     0 tok     real Kivy     buildozer
-     │          ▲                     │
-     └──────────┴───── AI FIX ◀───────┘
-                 only when free repair can't
-```
-
-<br>
-
-<div align="center">
-
-| | |
-|:--|:--|
-| 🧠 **Forge** | Describe it in a sentence. Get a complete, styled, single-file Kivy app. |
-| 🔍 **Lint** | 20+ static checks for the things that only break *on device*. Live as you type. |
-| 🔧 **Repair** | Deterministic fixes for the common faults. **Costs nothing.** |
-| 🧪 **Self-test** | 10 phases on a virtual display — including pressing every button. |
-| 🔁 **Verify** | One button runs the whole loop until it passes, then stops. |
-| 📦 **Build** | Streams the Buildozer log, hands you the `.apk`. |
-| 💰 **Meter** | Live token counter and a hard session budget. Nothing runs away. |
-
-</div>
-
----
-
-## Quick start
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
-androdawg
-```
-
-Add your SiliconFlow key in **Settings (⚙)**, type what you want, hit **Forge & verify**.
-
----
-
-## What's new in v3.1
-
-**Runs great on CachyOS / Arch.** The installer now auto-detects your package manager —
-`pacman` on CachyOS/Arch/Manjaro/EndeavourOS (first-class), with `apt`, `dnf` and `zypper`
-kept as fallbacks. On Arch it pulls `jdk17-openjdk` and `xorg-server-xvfb` straight from the
-official repos, and because Arch's xvfb ships `Xvfb` but not the `xvfb-run` wrapper, the
-self-test now launches `Xvfb` itself — so the pre-build crash check works on CachyOS
-(including Wayland/KDE) out of the box. Every "install X" hint prints the right `pacman`
-command instead of a useless `apt` one.
-
-**The `class App(App)` crash is fixed for good.** Models love to name their class `App`,
-which shadows Kivy's own `App` and failed the self-test with *"no App subclass found"* every
-round. **Repair free** now rewrites that collision automatically at zero tokens, the self-test
-finds the app no matter what it's named, and the kit tolerates the bad constructor kwargs
-(`Card(fill=True)`, `GradientBackground(strips=[])`, stray layout kwargs) that used to crash
-`build()`.
-
-**📱 Preview before you build.** One click opens your app in a window sized to a real Android
-screen — status bar, notch, rounded corners, home indicator and all — so you *see and tap*
-exactly what the phone will show, in two seconds, without the 20–40 minute Buildozer run.
-Pick from a dozen device profiles (Pixel, Galaxy, OnePlus, tablets). It's also a standalone
-tool: `python3 preview.py main.py --device galaxy_s24`.
-
-**Prettier icons.** A new `iconsmith` generates crisp squircle launcher icons with a real
-monogram, a round variant, adaptive foreground/background layers and a matching presplash —
-all in pure Python, no PIL, so nothing new ever has to survive python-for-android.
-
-New files alongside `apkforge.py`: `preview.py`, `devices.py`, `iconsmith.py`. Verify them
-with `python3 selftest_modules.py`.
-
----
-
-## Why v3 exists
-
-**v2 was lying to the model.**
-
-Its system prompt advertised a UI kit that did not exist. It told the AI to use `Theme.BG`,
-`Theme.TXT`, `Theme.ACCENT2`, `Theme.GOOD`, `Theme.BAD` and `IconButton(glyph=)` — while the
-kit actually shipped `Theme.bg`, `Theme.text`, `Theme.accent`, `Theme.ok`, `Theme.danger`
-and `IconButton(text=)`.
-
-So every forged app that touched the theme was an `AttributeError` waiting to happen. And you
-found out **forty minutes into a Buildozer run**. The bundled game template had the same bug.
-
-v3 fixes it at the root: the prompt's API reference is now **generated from the kit's own AST
-at import time**, and a test asserts every name it mentions really exists in the kit source.
-The prompt and the kit can no longer drift apart.
-
-Then v3 assumes the model *will still* make mistakes, and puts three nets under it — a static
-analyser that understands the kit, a deterministic repair pass that costs nothing, and a
-self-test that launches the app for real and presses its buttons.
-
----
-
-## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
-```
-
-On **CachyOS / Arch** it uses `pacman` automatically (`jdk17-openjdk`, `xorg-server-xvfb`,
-`base-devel`, …); on Debian/Kali it uses `apt` + Temurin 17 exactly as before. You can also
-run it from a local checkout: `bash install.sh`.
-
-One paste, does everything:
-
-- wipes any previous install (**keeps your saved API key**)
-- installs system deps and sets up **JDK 17** via Temurin — Kali has no `openjdk-17` package
-- installs buildozer + cython into your user site
-- best-effort installs **xvfb + host Kivy** so the self-test works
-- pulls `apkforge.py` + `icon.png`
-- drops a clickable app-menu entry wired to its own panel icon
-
-Re-running it is a clean reinstall.
-
-**Run it:** click *The Dawg APK Forge* in your app menu, or type `androdawg`.
-
-It opens in its own app window (Brave/Chromium `--app` mode — not a browser tab) under its
-own taskbar entry with its own icon. Single-instance: launching again focuses the running
-window. Set `DAWG_BROWSER` to force a specific binary. Projects and built APKs land in
-`~/AndroDawg/projects`.
-
-### Keys
-
-Set them in **Settings (⚙)** inside the app, or via env:
-
-```bash
-export SILICONFLOW_API_KEY=sk-...
-export GROQ_API_KEY=gsk_...
-```
-
-Settings-panel keys persist to `~/.androdawg/config.json` (chmod 600) and take effect
-immediately — no restart. Stored keys beat env. **SiliconFlow is primary, Groq is the
-fallback.** Model and base URL are changeable in the same panel.
-
----
-
-## Two ways in
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### ⚡ AI FORGE
+**🔨 You describe it**
+> *"A price-compare app for record shops in Limerick — search a title, list shops with prices, save favourites."*
 
-Describe the app. The model writes a complete single-file Kivy app on top of the built-in UI
-kit, declares its own requirements, permissions and orientation, and may set safe build
-options inside guardrails.
-
-Quick-refine chips are one click: *polish look*, *add sound*, *add settings*, *add scores*,
-*theme toggle*.
-
-**Forge & verify** runs the entire loop unattended — forge → free repair → static gate →
-self-test → targeted fix → repeat — until it passes or hits a stop condition.
+**👁 You watch it forge**
+> Static-checked → launched on a hidden display → every button tapped → *caught 2 issues* → fixed → ✓ passed.
 
 </td>
 <td width="50%" valign="top">
 
-### ✎ MANUAL
+**▶ You preview it**
+> One click opens the real app in a phone-sized window on your desktop. No build, no phone needed.
 
-Opens a **genuinely empty file**. No kit, no scaffold, nothing to delete before you start.
-
-Add the UI kit with one button if you want it. Or drop in a starter: *minimal Kivy*, *kit
-starter*, *form + list*, *game loop*.
-
-You can still hand-write a full raw `buildozer.spec`. Same validate → self-test → build
-pipeline either way, and the same free repair pass.
+**◆ You build it**
+> A real Android `.apk`, built through an isolated toolchain — refused up front if the app would crash on the phone.
 
 </td>
 </tr>
@@ -198,254 +57,83 @@ pipeline either way, and the same free repair pass.
 
 ---
 
-## What stops your APKs failing to launch
+## Install
 
-### 1 · Static analysis — live, as you type, free
-
-Errors block the build outright. Warnings and info are advisory. Every finding carries a fix hint.
-
-| Check | Why it matters |
-|---|---|
-| **Wrong `Theme.` attribute** | The #1 v2 crash. Names the correct spelling. |
-| **Fake kit keyword** | `IconButton(glyph=)` → `TypeError` on construction. Names the real one. |
-| **Undefined names** | Catches invented widgets and plain typos before they `NameError` on device. |
-| **Non-Kivy toolkits** | tkinter / PyQt / PySide / GTK / wx / curses never survive python-for-android. |
-| **Undeclared recipe import** | `import requests` without it in `requirements` → guaranteed `ImportError`. |
-| **Unguarded android-only import** | Needs an `if platform == "android":` guard or it kills desktop too. |
-| **External `.kv` load** | The APK is built from a single `main.py`. |
-| **`os.system` / `subprocess`** | There is no shell on Android. |
-| **`time.sleep` on the UI thread** | Freezes the app; Android shows an ANR. |
-| **`__init__` not chaining `super()`** | Silently breaks `size_hint` / `pos_hint` layout. |
-| **Threads touching widgets** | Corrupts the render and crashes on device. |
-| **`schedule_interval(…, 0)`** | Uncapped every-frame loop: battery drain and jank. |
-| **Relative file writes** | Android sandboxes the cwd — paths must go through `user_data_dir`. |
-| **Network without `INTERNET`** | Requests fail silently on device. |
-| **Missing assets · `input()` · `Window.size` · mutable defaults · bare `except:`** | The usual quiet killers. |
-
-### 2 · Repair free — deterministic fixes, **zero tokens**
-
-Runs *before* any model call, so the expensive part is only asked about problems that code
-genuinely can't solve on its own. An actual run against five seeded bugs:
+From a clone (recommended while iterating):
 
 ```
-* Theme.TXT -> Theme.text
-* IconButton(glyph=) -> IconButton(text=) x1
-* removed 1 Window.size/fullscreen assignment (Buildozer owns sizing)
-* added 'requests' to requirements (imported as requests)
-* added INTERNET permission (the app makes network calls)
-
-remaining issues: (none)          tokens spent: 0
+./install.sh
 ```
 
-It also re-attaches a missing `.run()` entry point, and it's idempotent — running it again on
-clean code changes nothing.
+The installer needs **no root** — everything lands under `$HOME`. It:
 
-### 3 · Self-test — it actually runs the thing
+- installs the system build tools (via pacman / apt / dnf / zypper) — `base-devel`, autoconf,
+  libtool, pkg-config, cmake, git, zip/unzip, and a **JDK 17** for the Android build;
+- sets up an **isolated Python 3.12 with Kivy** for the crash check + preview — so you never
+  see "no module named kivy" again. If your system Python is too new for Kivy (CachyOS/Arch
+  ship 3.14, which Kivy has no wheels for), it **downloads a self-contained CPython 3.12
+  automatically** — no root, no AUR, no compiler;
+- sets up an **isolated build environment** (Python 3.12 + buildozer + cython) so the APK
+  build never touches — or is broken by — your system Python;
+- drops an `androdawg` launcher into `~/.local/bin` and an app-menu entry.
 
-v2 ran the app for two seconds and called that a pass. v3 drives **ten phases** on a virtual
-display and reports each one separately:
-
-| # | Phase | What it proves |
-|:--|:--|:--|
-| 1 | `compile` | The file is valid Python. |
-| 2 | `import` | Module-level code doesn't explode. |
-| 3 | `instantiate` | The `App` subclass constructs. |
-| 4 | `build` | `build()` returns a root widget. |
-| 5 | `widget_tree` | Reports widget count and tree depth. |
-| 6 | `render` | Four real frames get drawn. |
-| 7 | **`touch`** | **Every button in the tree is pressed.** |
-| 8 | `rotate` | Survives a portrait ↔ landscape flip. |
-| 9 | `soak` | 3 seconds of frames; catches exceptions thrown from timers and callbacks. |
-| 10 | `teardown` | `on_stop` runs clean. |
-
-**Phase 7 is the one that earns its keep.** An app whose handler references an attribute that
-was never assigned passes v2 and fails v3:
+Then just run:
 
 ```
-✓ compile   ✓ import   ✓ instantiate   ✓ build   ✓ widget_tree   ✓ render
-✗ touch     1/1 handlers raised — PillButton (label 'TAP'):
-            self.counter.text = "hit"        ← AttributeError
-✓ rotate    ✓ soak     ✓ teardown
+androdawg
 ```
 
-The real traceback feeds straight into **Auto-fix**. No host Kivy? It reports *skipped* and
-the build still works — static analysis still gates it.
+Set your API key in the app (the gear, top-right). Re-running `./install.sh` updates in place.
 
 ---
 
-## Token spend: visible, capped, and mostly avoided
+## What it does, step by step
 
-The UI kit is 305 lines. **v2 sent it to the model on every fix and polish — and had the
-model echo the whole thing back.** Measured waste: **~2,938 tokens each way, every round.**
+1. **Forge** — you describe the app; the model writes a single-file Kivy app on top of a
+   built-in UI kit (cards, buttons, chips, a scaffold, crash-proof storage) so it looks like
+   a real app, not default-Kivy grey.
+2. **Static check (instant)** — catches the whole class of Kivy mistakes before running
+   anything: undefined names, wrong `Theme` attributes, `id=` passed to a widget, wrong
+   `kivy.*` import paths, direct `JsonStore` misuse, unguarded android-only imports.
+3. **Crash check (seconds)** — actually runs the app on a hidden display: compiles, imports,
+   builds the UI, taps every button, rotates, and soaks for a moment. A real traceback here
+   is a bug that *would* have crashed on your phone.
+4. **Auto-fix** — sends the exact, app-relative traceback back to the model (or repairs common
+   issues locally for free) and re-checks, up to a few rounds, until it passes.
+5. **Preview** — opens the real app in a phone-sized window so you can try it yourself.
+6. **Build** — refuses to start a ~40-minute build if the app still crashes or a build tool is
+   missing (it tells you the exact packages to install). Otherwise it builds the `.apk`
+   through the isolated Python 3.12 toolchain and hands you the file.
 
-| | v2 | v3 |
-|:--|:--|:--|
-| Kit in AI calls | sent **and** echoed back | **stripped**, re-attached server-side |
-| Follow-up context | replayed every previous full app | short user turns + current code, once |
-| Repeat requests | billed every time | **served from disk cache, free** |
-| Common mistakes | a paid fix round | **repaired locally, 0 tokens** |
-| `max_tokens` | 16,000 | 12,000, configurable |
-| Fix temperature | 0.4 | 0.15 — a fix stays a fix, not a rewrite |
-| Spend visibility | none | live meter + hard session budget |
-
-The header carries a running token count. **Settings → Token spend** exposes a hard session
-budget, per-call `max_tokens`, the auto-fix round count, and toggles for the response cache
-and local repair.
-
-**Forge & verify refuses to run away with your key.** It stops when it runs out of rounds,
-when the budget is spent, or when the model returns identical code twice.
-
-Measured, end to end, on a genuinely broken app:
-
-```
-FINAL STATUS : done            MODEL CALLS : 2
-chars per call: [5386, 3920]   ← the 12 KB kit never crossed the wire
-```
+You can keep talking to the AI to change an app after it's forged — the **Improve with AI**
+box edits the current app in place, it doesn't start over.
 
 ---
 
-## Why the apps don't look like default-Kivy grey
+## Requirements
 
-Every forged app gets a small, battle-tested **UI kit** prepended — pure Kivy, no external
-deps, so it always survives python-for-android:
-
-<div align="center">
-
-`Theme` · `GradientBackground` · `AppBar` · `Card` · `PillButton` · `IconButton`
-`TextField` · `Divider` · `heading()` · `body()` · `toast()`
-
-</div>
-
-`Theme.seed("Your App")` derives a unique primary/accent colour from the app's own name, so
-two apps never look identical. The model builds its screens out of these instead of raw grey
-widgets.
-
-You still see the **full assembled file** in the editor — nothing is hidden — and the kit's
-line numbers are dimmed in the gutter so it's always obvious which code is yours.
-
-It also generates a real **launcher icon and presplash** in pure Python (no PIL) and wires
-`android.presplash_color`, so there's **no white flash on launch**.
+- **Linux** (first-class: CachyOS / Arch; also Debian/Ubuntu/Kali, Fedora, openSUSE).
+- **Python 3.10+** to run AndroDawg itself. The Android build and crash check run on their own
+  isolated Python 3.12 that the installer sets up — your system Python is never used or altered.
+- An API key for a supported provider (set inside the app). Nothing is sent anywhere else.
+- Disk: the **first** APK build downloads the Android SDK/NDK (~2–3 GB) and compiles the
+  native libraries — budget ~5–6 GB free and 20–40 minutes. Later builds take minutes.
 
 ---
 
-## Build config
+## Honest notes
 
-The AI may only set **whitelisted, value-validated** spec keys: `orientation`, `fullscreen`,
-`api` (24–35), `minapi` (21–30), `wakelock`, `presplash_color`. Anything else it tries is
-dropped with a warning, so a bad model response can't brick a 40-minute build. In manual mode
-you own the whole spec.
-
-- Default arch is **arm64-v8a** — every modern phone, and it halves build time. Tick
-  `armeabi-v7a` in the advanced panel if you need 32-bit as well.
-- `android.api 34` / `android.minapi 24` by default.
-
-Hard blockers refuse the build outright: syntax errors, non-Kivy GUI toolkits, and buildozer
-missing from PATH. A wrong JDK is caught in preflight instead of dying at the Gradle step.
+- **Python 3.14 host?** Kivy 2.3.1 has no 3.14 wheels, so AndroDawg quietly runs the crash
+  check, preview, and APK build on its own bundled Python 3.12. You don't have to downgrade
+  anything.
+- **The crash check is not a guarantee of a perfect app** — but if it passes, the app really
+  did launch and every button fired without an exception. It exists so a broken app is caught
+  in seconds here, not after a 40-minute build and an install on your phone.
+- **What runs where:** forging and fixing use your chosen AI provider; everything else — the
+  static check, crash check, preview, and build — is local.
 
 ---
 
-## Suggested flow
+## License
 
-1. **Check the environment pill** in the header — buildozer, java, keys, cache, and whether
-   self-test is available.
-2. **Smoke test once.** A built-in, guaranteed-buildable app. Build it to prove your
-   toolchain works end to end *before* you start trusting AI output.
-3. **Forge & verify** a description — or switch to **MANUAL** and start from an empty file.
-4. **Repair free** first, **Auto-fix** for what's left, **Polish** for looks. **Self-test**
-   to confirm it launches and survives taps.
-5. **Build APK** → streams the Buildozer log → **Download APK**. Or **Download project
-   (.zip)** to get `main.py` + `buildozer.spec` + generated icon/presplash and build it
-   anywhere.
-
----
-
-## HTTP API
-
-Everything the UI does is a plain endpoint on `127.0.0.1:8731`. Fully scriptable.
-
-| Method | Route | Does |
-|:--|:--|:--|
-| `POST` | `/api/forge` | Generate an app from a description |
-| `POST` | `/api/autoforge` | Run the full forge → verify → fix loop as a background job |
-| `GET` | `/api/job?id=` | Poll a job — steps, phases, current payload |
-| `POST` | `/api/lint` | Static analysis only. Instant, free |
-| `POST` | `/api/repair` | Deterministic local fixes. Free |
-| `POST` | `/api/fix` | Targeted AI fix from an error or traceback |
-| `POST` | `/api/polish` | AI restyle pass |
-| `POST` | `/api/testrun` → `GET /api/testlog?id=` | Run the 10-phase self-test |
-| `POST` | `/api/build` → `GET /api/log?id=` → `GET /api/apk?id=` | Build and fetch the APK |
-| `POST` | `/api/manual` | Wrap hand-written code, with or without the kit |
-| `POST` | `/api/project_zip` | Buildozer-ready project archive |
-| `GET` | `/api/usage` | Token spend, budget, remaining |
-| `GET` `POST` | `/api/config` | Keys, model, endpoints, efficiency knobs |
-| `GET` | `/api/doctor` · `/api/templates` · `/api/template?id=` · `/api/smoketest` · `/api/ping` | Environment and starters |
-| `POST` | `/api/cache_clear` · `/api/quit` | Housekeeping |
-
----
-
-## Test it yourself
-
-```bash
-python3 selftest.py
-```
-
-**334 assertions, all green.** No API key, no Android toolchain needed — the AI and buildozer
-are both mocked.
-
-<details>
-<summary><b>What the suite covers</b></summary>
-
-<br>
-
-- **Parser / validator** — adversarial model output, plus a **200,000-iteration fuzz** for
-  determinism and no-crash behaviour.
-- **Kit API contract** — every `Theme.` attribute the prompt advertises must exist in the kit
-  source; the v2 ghosts (`Theme.BG`, `IconButton(glyph=)`) must be gone; every shipped
-  template must parse and analyse clean.
-- **Static analysis** — each check fires on a seeded bug *and stays quiet on healthy code*.
-  False positives are treated as failures.
-- **Auto-repair** — fixes applied, idempotent on a second pass, and asserted to spend
-  **exactly zero tokens**.
-- **Token discipline** — kit stripping round-trips losslessly, saves >1000 tokens per call,
-  metering accumulates correctly, and the budget guard actually refuses.
-- **Full HTTP pipeline** — mocked AI + mocked buildozer, build-refusal paths, malformed
-  bodies, unknown routes, settings clamping, and key handling that never leaks a raw key.
-- **v3 endpoints** — including a check that the UI actually wires up every route it calls.
-
-Pass a smaller fuzz count to go faster:
-
-```bash
-python3 selftest.py 1000
-```
-
-</details>
-
----
-
-## Notes & gotchas
-
-- Only **Kivy** survives the python-for-android pipeline. Generated apps are Kivy, always.
-- The first build downloads the Android SDK/NDK (~20–40 min). `~/.buildozer` caches it, so
-  later builds are minutes.
-- **JDK 17–24 required.** Buildozer's bundled Gradle can't run on JDK 25+ (Kali's default) —
-  it dies on class file major 69. The app points `JAVA_HOME` at a compatible JDK
-  automatically when one is installed, and refuses the build early with instructions when
-  it isn't.
-- Traceback line numbers refer to the **full** file. The kit is 305 lines, so subtract that
-  to find the line in your own code. The gutter dims the kit range to make this obvious.
-- The self-test needs host Kivy + xvfb. Without them it reports *skipped*; static analysis
-  still gates the build.
-- The whole server is **Python stdlib only**. The only third-party things involved are
-  buildozer (for building) and Kivy (for testing) — neither is needed to run the tool itself.
-
----
-
-<div align="center">
-
-<br>
-
-**MIT** — do what you like with it.
-
-Built by [**the-priest**](https://github.com/the-priest)
-
-</div>
+MIT. See [LICENSE](LICENSE).

@@ -320,7 +320,7 @@ def run_http_pipeline():
         # index
         s, b = http_bytes(base + "/")
         check("GET / 200", s == 200)
-        check("GET / has html", b'THE DAWG' in b)
+        check("GET / has html", b'AndroDawg' in b or b'ANDRODAWG' in b)
 
         # doctor
         s, d = http_json("GET", base + "/api/doctor")

@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
     "token_budget": 0,        # 0 = unlimited; otherwise a hard session cap
     "cache": True,            # reuse identical prior responses for free
     "auto_repair": True,      # fix what we can locally before ever calling the AI
-    "agent_rounds": 3,        # max fix rounds in the autoforge loop
+    "agent_rounds": 5,        # max fix rounds in the autoforge loop
 }
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -188,7 +188,7 @@ def groq_key():
 # ----------------------------------------------------------------- UI KIT (prepended to forged apps)
 KIT_BEGIN = "# ===== DAWG UI KIT"
 KIT_END = "# ===== END DAWG UI KIT ====="
-KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.uix.scrollview import ScrollView\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\ndef _kit_col(c, fallback):\n    """Coerce anything into a valid RGBA colour, so a stray bool/None/str can\'t crash a\n    widget at build time. Accepts a 3/4-tuple, a #hex string, or falls back."""\n    try:\n        if isinstance(c, str) and c.strip():\n            return _hx(c)\n        if isinstance(c, (tuple, list)) and len(c) in (3, 4):\n            return tuple(list(c) + [1])[:4]\n    except Exception:\n        pass\n    return fallback\n\n\ndef _kit_int(v, fallback):\n    """Coerce to a positive int (for counts like gradient strips)."""\n    try:\n        v = int(v)\n        return v if v > 0 else fallback\n    except Exception:\n        return fallback\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=64, **kw):\n        super().__init__(**kw)\n        self._top = _kit_col(top, Theme.bg)\n        self._bottom = _kit_col(bottom, Theme.bg2)\n        self._strips = _kit_int(strips, 48)\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(_kit_col(fill, Theme.surface), radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft, layered drop shadow (three stacked, fading offsets)\n            for _o, _a in ((dp(6), 0.10), (dp(3), 0.16), (dp(1), 0.22)):\n                Color(0, 0, 0, _a)\n                RoundedRectangle(pos=(self.x, self.y - _o),\n                                 size=(self.width, self.height),\n                                 radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "middle")\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "top")\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n\nclass Row(BoxLayout):\n    """Horizontal group with sensible spacing -- put buttons/chips side by side."""\n    def __init__(self, height=dp(52), **kw):\n        kw.setdefault("orientation", "horizontal")\n        kw.setdefault("spacing", Theme.gap)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", height)\n        super().__init__(**kw)\n\n\nclass Chip(Label, _Rounded):\n    """Small rounded pill for tags/labels. fill takes an rgba tuple or Theme colour."""\n    def __init__(self, text="", fill=None, **kw):\n        kw.setdefault("font_size", sp(13))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("padding", (dp(12), dp(6)))\n        kw.setdefault("color", Theme.on_primary)\n        super().__init__(text=text, **kw)\n        self.texture_update()\n        self.size = (self.texture_size[0] + dp(24), self.texture_size[1] + dp(14))\n        self._paint(_kit_col(fill, Theme.primary), radius=self.height / 2.0, border=None)\n\n\nclass Meter(Widget):\n    """Themed progress/meter bar. value is 0..1; call set_progress(v) to update."""\n    def __init__(self, value=0.0, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(10))\n        super().__init__(**kw)\n        try:\n            self._value = max(0.0, min(1.0, float(value)))\n        except Exception:\n            self._value = 0.0\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def set_progress(self, v):\n        try:\n            self._value = max(0.0, min(1.0, float(v)))\n        except Exception:\n            self._value = 0.0\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self.height / 2.0])\n            Color(*Theme.primary)\n            RoundedRectangle(pos=self.pos,\n                             size=(self.width * self._value, self.height),\n                             radius=[self.height / 2.0])\n\n\nclass Scaffold(FloatLayout):\n    """One-call polished screen: gradient background + AppBar + a scrollable, padded\n    content column. Return it from build(); add your widgets via .add(widget) (or to\n    .content). Everything grows and scrolls on its own -- the fastest route to a\n    screen that looks designed instead of default-Kivy."""\n    def __init__(self, title="App", subtitle="", **kw):\n        super().__init__(**kw)\n        self.add_widget(GradientBackground(size_hint=(1, 1)))\n        col = BoxLayout(orientation="vertical", size_hint=(1, 1))\n        col.add_widget(AppBar(title=title, subtitle=subtitle))\n        sv = ScrollView(size_hint=(1, 1), bar_width=dp(3))\n        self.content = BoxLayout(orientation="vertical", size_hint_y=None,\n                                 padding=Theme.pad, spacing=Theme.gap)\n        self.content.bind(minimum_height=self.content.setter("height"))\n        sv.add_widget(self.content)\n        col.add_widget(sv)\n        self.add_widget(col)\n\n    def add(self, widget):\n        """Add a widget to the scrolling content column and return it."""\n        self.content.add_widget(widget)\n        return widget\n\n# ===== END DAWG UI KIT =====\n'
+KIT = '# ===== DAWG UI KIT (pure Kivy, no external deps) =====\n# A small, battle-tested component kit that makes generated apps look modern\n# instead of default-Kivy grey. Pure kivy + stdlib only -> always builds on p4a.\nimport hashlib\nimport os\nfrom kivy.metrics import dp, sp\nfrom kivy.animation import Animation\nfrom kivy.clock import Clock\nfrom kivy.properties import ListProperty\nfrom kivy.graphics import Color, RoundedRectangle, Rectangle, Line\nfrom kivy.uix.widget import Widget\nfrom kivy.uix.label import Label\nfrom kivy.uix.button import Button\nfrom kivy.uix.boxlayout import BoxLayout\nfrom kivy.uix.floatlayout import FloatLayout\nfrom kivy.uix.textinput import TextInput\nfrom kivy.uix.scrollview import ScrollView\nfrom kivy.core.window import Window\n\n\ndef _hx(h):\n    h = h.lstrip("#")\n    if len(h) == 6:\n        h += "ff"\n    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4, 6))\n\n\ndef _mix(a, b, t):\n    return tuple(a[i] * (1 - t) + b[i] * t for i in range(4))\n\n\ndef _kit_col(c, fallback):\n    """Coerce anything into a valid RGBA colour, so a stray bool/None/str can\'t crash a\n    widget at build time. Accepts a 3/4-tuple, a #hex string, or falls back."""\n    try:\n        if isinstance(c, str) and c.strip():\n            return _hx(c)\n        if isinstance(c, (tuple, list)) and len(c) in (3, 4):\n            return tuple(list(c) + [1])[:4]\n    except Exception:\n        pass\n    return fallback\n\n\ndef _kit_int(v, fallback):\n    """Coerce to a positive int (for counts like gradient strips)."""\n    try:\n        v = int(v)\n        return v if v > 0 else fallback\n    except Exception:\n        return fallback\n\n\nclass Theme:\n    """Central palette. accent is derived from a seed so each app feels distinct."""\n    bg        = _hx("#0c0f14")\n    bg2       = _hx("#11161f")\n    surface   = _hx("#161d29")\n    surface2  = _hx("#1d2736")\n    line      = _hx("#27303f")\n    text      = _hx("#eaf0f7")\n    muted     = _hx("#8b97a8")\n    primary   = _hx("#4f7cff")\n    primary_d = _hx("#3b63e0")\n    accent    = _hx("#27e0b0")\n    danger    = _hx("#ff5d6c")\n    ok        = _hx("#37d98a")\n    warn      = _hx("#ffba49")\n    on_primary = _hx("#ffffff")\n    radius    = dp(16)\n    pad       = dp(18)\n    gap       = dp(12)\n\n    @classmethod\n    def seed(cls, name):\n        """Tint the accent/primary from an app name so identity is consistent."""\n        if not name:\n            return\n        hue = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 360\n        cls.primary = cls._hsl(hue, 0.78, 0.62)\n        cls.primary_d = cls._hsl(hue, 0.78, 0.50)\n        cls.accent = cls._hsl((hue + 150) % 360, 0.70, 0.58)\n\n    @staticmethod\n    def _hsl(h, s, l):\n        import colorsys\n        r, g, b = colorsys.hls_to_rgb(h / 360.0, l, s)\n        return (r, g, b, 1)\n\n\nclass GradientBackground(FloatLayout):\n    """Full-bleed vertical gradient drawn as strips (no texture flip surprises)."""\n    def __init__(self, top=None, bottom=None, strips=64, **kw):\n        super().__init__(**kw)\n        self._top = _kit_col(top, Theme.bg)\n        self._bottom = _kit_col(bottom, Theme.bg2)\n        self._strips = _kit_int(strips, 48)\n        self.bind(pos=self._redraw, size=self._redraw)\n        self._redraw()\n\n    def _redraw(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            n = self._strips\n            for i in range(n):\n                Color(*_mix(self._top, self._bottom, i / (n - 1)))\n                Rectangle(pos=(self.x, self.y + self.height * (1 - (i + 1) / n)),\n                          size=(self.width, self.height / n + 1))\n\n\nclass _Rounded:\n    """Mixin: paints a rounded background + optional border into canvas.before."""\n    def _paint(self, fill, radius=None, border=None, bw=1.2):\n        self._fill = fill\n        self._radius = radius if radius is not None else Theme.radius\n        self._border = border\n        self._bw = bw\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self._fill)\n            self._rr = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass Card(BoxLayout, _Rounded):\n    """A rounded surface panel with a faint border + soft drop shadow."""\n    def __init__(self, fill=None, radius=None, padding=None, **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("padding", padding if padding is not None else Theme.pad)\n        kw.setdefault("spacing", Theme.gap)\n        super().__init__(**kw)\n        self._paint(_kit_col(fill, Theme.surface), radius, border=Theme.line)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            # soft, layered drop shadow (three stacked, fading offsets)\n            for _o, _a in ((dp(6), 0.10), (dp(3), 0.16), (dp(1), 0.22)):\n                Color(0, 0, 0, _a)\n                RoundedRectangle(pos=(self.x, self.y - _o),\n                                 size=(self.width, self.height),\n                                 radius=[self._radius])\n            Color(*self._fill)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._border:\n                Color(*self._border)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=self._bw)\n\n\nclass AppBar(BoxLayout, _Rounded):\n    """Top title bar. Use as the first child of your root."""\n    def __init__(self, title="App", subtitle="", **kw):\n        kw.setdefault("orientation", "vertical")\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(64) if not subtitle else dp(78))\n        kw.setdefault("padding", (Theme.pad, dp(8)))\n        super().__init__(**kw)\n        self._paint(Theme.surface, radius=0, border=None)\n        t = Label(text=title, font_size=sp(20), bold=True, color=Theme.text,\n                  halign="left", valign="middle", shorten=True)\n        t.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n        self.add_widget(t)\n        if subtitle:\n            s = Label(text=subtitle, font_size=sp(12), color=Theme.muted,\n                      halign="left", valign="middle")\n            s.bind(size=lambda w, *a: setattr(w, "text_size", w.size))\n            self.add_widget(s)\n\n\nclass PillButton(Button):\n    """Rounded, animated, theme-coloured button. variant: \'primary\'|\'ghost\'|\'danger\'."""\n    cur = ListProperty([0, 0, 0, 0])  # animated fill colour\n\n    def __init__(self, text="", variant="primary", radius=None, **kw):\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(52))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""\n        self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._radius = radius if radius is not None else dp(14)\n        self._variant = variant\n        self._set_colors()\n        self.bind(pos=self._rp, size=self._rp, cur=self._rp,\n                  on_press=self._down, on_release=self._up)\n        self._rp()\n\n    def _set_colors(self):\n        if self._variant == "ghost":\n            self._base = (0, 0, 0, 0); self._edge = Theme.line; self.color = Theme.text\n        elif self._variant == "danger":\n            self._base = Theme.danger; self._edge = None; self.color = (1, 1, 1, 1)\n        else:\n            self._base = Theme.primary; self._edge = None; self.color = Theme.on_primary\n        self.cur = list(self._base)\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*self.cur)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius])\n            if self._edge:\n                Color(*self._edge)\n                Line(rounded_rectangle=(self.x, self.y, self.width, self.height,\n                                        self._radius), width=1.3)\n\n    def _down(self, *a):\n        target = _mix(self._base, (1, 1, 1, 1), 0.18) if self._variant != "ghost" \\\n            else (1, 1, 1, 0.08)\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(target), d=0.06).start(self)\n\n    def _up(self, *a):\n        Animation.cancel_all(self, "cur")\n        Animation(cur=list(self._base), d=0.12).start(self)\n\n\nclass IconButton(Button):\n    """Circular icon/text button."""\n    def __init__(self, text="+", diameter=dp(48), variant="primary", **kw):\n        kw.setdefault("font_size", sp(20))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("size", (diameter, diameter))\n        super().__init__(text=text, **kw)\n        self.background_normal = ""; self.background_down = ""\n        self.background_color = (0, 0, 0, 0)\n        self._variant = variant\n        self.color = Theme.on_primary if variant == "primary" else Theme.text\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        d = min(self.width, self.height)\n        with self.canvas.before:\n            Color(*(Theme.primary if self._variant == "primary" else Theme.surface2))\n            RoundedRectangle(pos=self.pos, size=(d, d), radius=[d / 2.0])\n\n\nclass TextField(TextInput):\n    """Rounded, padded, theme-coloured single/multi-line input."""\n    def __init__(self, hint="", **kw):\n        kw.setdefault("multiline", False)\n        kw.setdefault("font_size", sp(16))\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(50))\n        kw.setdefault("padding", (dp(14), dp(13)))\n        super().__init__(**kw)\n        self.background_normal = ""; self.background_active = ""\n        self.background_color = (0, 0, 0, 0)\n        self.foreground_color = Theme.text\n        self.cursor_color = Theme.primary\n        self.hint_text = hint\n        self.hint_text_color = Theme.muted\n        self.bind(pos=self._rp, size=self._rp, focus=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])\n            Color(*(Theme.primary if self.focus else Theme.line))\n            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)),\n                 width=1.4 if self.focus else 1.1)\n\n\nclass Divider(Widget):\n    def __init__(self, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(1))\n        super().__init__(**kw)\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.line)\n            Rectangle(pos=self.pos, size=self.size)\n\n\ndef heading(text, size=24, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "middle")\n    l = Label(text=text, font_size=sp(size), bold=True, color=Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1] + dp(6)))\n    return l\n\n\ndef body(text, muted=True, size=14, **kw):\n    kw.setdefault("halign", "left"); kw.setdefault("valign", "top")\n    l = Label(text=text, font_size=sp(size),\n              color=Theme.muted if muted else Theme.text,\n              size_hint_y=None, **kw)\n    l.bind(width=lambda w, *a: setattr(w, "text_size", (w.width, None)),\n           texture_size=lambda w, *a: setattr(w, "height", w.texture_size[1]))\n    return l\n\n\ndef toast(message, duration=1.6):\n    """Floating, auto-dismissing message at the bottom of the window."""\n    lbl = Label(text=message, color=Theme.text, font_size=sp(14),\n                size_hint=(None, None), padding=(dp(16), dp(10)))\n    lbl.texture_update()\n    lbl.size = (lbl.texture_size[0] + dp(32), lbl.texture_size[1] + dp(20))\n    with lbl.canvas.before:\n        Color(*Theme.surface2)\n        r = RoundedRectangle(radius=[dp(12)])\n    def _sync(*a):\n        r.pos = lbl.pos; r.size = lbl.size\n    lbl.bind(pos=_sync, size=_sync)\n    lbl.pos = ((Window.width - lbl.width) / 2, dp(60))\n    Window.add_widget(lbl)\n    def _gone(*a):\n        try:\n            Window.remove_widget(lbl)\n        except Exception:\n            pass\n    Clock.schedule_once(_gone, duration)\n\nclass Row(BoxLayout):\n    """Horizontal group with sensible spacing -- put buttons/chips side by side."""\n    def __init__(self, height=dp(52), **kw):\n        kw.setdefault("orientation", "horizontal")\n        kw.setdefault("spacing", Theme.gap)\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", height)\n        super().__init__(**kw)\n\n\nclass Chip(Label, _Rounded):\n    """Small rounded pill for tags/labels. fill takes an rgba tuple or Theme colour."""\n    def __init__(self, text="", fill=None, **kw):\n        kw.setdefault("font_size", sp(13))\n        kw.setdefault("bold", True)\n        kw.setdefault("size_hint", (None, None))\n        kw.setdefault("padding", (dp(12), dp(6)))\n        kw.setdefault("color", Theme.on_primary)\n        super().__init__(text=text, **kw)\n        self.texture_update()\n        self.size = (self.texture_size[0] + dp(24), self.texture_size[1] + dp(14))\n        self._paint(_kit_col(fill, Theme.primary), radius=self.height / 2.0, border=None)\n\n\nclass Meter(Widget):\n    """Themed progress/meter bar. value is 0..1; call set_progress(v) to update."""\n    def __init__(self, value=0.0, **kw):\n        kw.setdefault("size_hint_y", None)\n        kw.setdefault("height", dp(10))\n        super().__init__(**kw)\n        try:\n            self._value = max(0.0, min(1.0, float(value)))\n        except Exception:\n            self._value = 0.0\n        self.bind(pos=self._rp, size=self._rp)\n        self._rp()\n\n    def set_progress(self, v):\n        try:\n            self._value = max(0.0, min(1.0, float(v)))\n        except Exception:\n            self._value = 0.0\n        self._rp()\n\n    def _rp(self, *a):\n        self.canvas.before.clear()\n        with self.canvas.before:\n            Color(*Theme.surface2)\n            RoundedRectangle(pos=self.pos, size=self.size, radius=[self.height / 2.0])\n            Color(*Theme.primary)\n            RoundedRectangle(pos=self.pos,\n                             size=(self.width * self._value, self.height),\n                             radius=[self.height / 2.0])\n\n\nclass Scaffold(FloatLayout):\n    """One-call polished screen: gradient background + AppBar + a scrollable, padded\n    content column. Return it from build(); add your widgets via .add(widget) (or to\n    .content). Everything grows and scrolls on its own -- the fastest route to a\n    screen that looks designed instead of default-Kivy."""\n    def __init__(self, title="App", subtitle="", **kw):\n        super().__init__(**kw)\n        self.add_widget(GradientBackground(size_hint=(1, 1)))\n        col = BoxLayout(orientation="vertical", size_hint=(1, 1))\n        col.add_widget(AppBar(title=title, subtitle=subtitle))\n        sv = ScrollView(size_hint=(1, 1), bar_width=dp(3))\n        self.content = BoxLayout(orientation="vertical", size_hint_y=None,\n                                 padding=Theme.pad, spacing=Theme.gap)\n        self.content.bind(minimum_height=self.content.setter("height"))\n        sv.add_widget(self.content)\n        col.add_widget(sv)\n        self.add_widget(col)\n\n    def add(self, widget):\n        """Add a widget to the scrolling content column and return it."""\n        self.content.add_widget(widget)\n        return widget\n\n\nclass Store:\n    """Dead-simple, CRASH-PROOF persistence -- use this for all saving/loading.\n        Store.save(key, value)            # persist any JSON-able value\n        value = Store.load(key, default)  # returns default if missing (never raises)\n        Store.has(key)  ->  bool\n        Store.delete(key)\n    Backed by Kivy JsonStore in the app\'s user_data_dir. NEVER use JsonStore directly:\n    its .get(key) raises KeyError when the key is missing and takes no default= -- Store\n    handles both so a first launch (nothing saved yet) can\'t crash the app."""\n    _s = None\n\n    @classmethod\n    def _store(cls):\n        if cls._s is None:\n            from kivy.storage.jsonstore import JsonStore\n            base = "."\n            try:\n                from kivy.app import App\n                app = App.get_running_app()\n                if app and getattr(app, "user_data_dir", None):\n                    base = app.user_data_dir\n            except Exception:\n                pass\n            try:\n                os.makedirs(base, exist_ok=True)\n            except Exception:\n                pass\n            cls._s = JsonStore(os.path.join(base, "app_store.json"))\n        return cls._s\n\n    @classmethod\n    def save(cls, key, value):\n        try:\n            cls._store().put(str(key), value=value)\n        except Exception:\n            pass\n\n    @classmethod\n    def load(cls, key, default=None):\n        try:\n            s = cls._store()\n            return s.get(str(key))["value"] if s.exists(str(key)) else default\n        except Exception:\n            return default\n\n    @classmethod\n    def has(cls, key):\n        try:\n            return cls._store().exists(str(key))\n        except Exception:\n            return False\n\n    @classmethod\n    def delete(cls, key):\n        try:\n            s = cls._store()\n            if s.exists(str(key)):\n                s.delete(str(key))\n        except Exception:\n            pass\n\n# ===== END DAWG UI KIT =====\n'
 
 
 def ensure_kit(code):
@@ -307,6 +307,10 @@ def kit_api_reference():
         ("Meter", "themed progress/meter bar; value 0..1, call .set_progress(v)."),
         ("Divider", "thin separator line."),
     ]
+    sigs.append(("Store", "CRASH-PROOF persistence -- Store.save(key, value) and "
+                          "Store.load(key, default). Use this for all saving/loading; it "
+                          "returns the default when a key is missing so a first launch can't "
+                          "crash. Never touch JsonStore directly."))
     for name, blurb in sigs:
         kw = KIT_INFO["ctor_kwargs"].get(name, set())
         args = ", ".join(sorted(kw)) if kw else ""
@@ -506,7 +510,10 @@ HARD RULES
         from android.permissions import request_permissions, Permission
         request_permissions([Permission.INTERNET])
 - The app MUST also run on desktop (python3 main.py) so it can be test-run before building: keep every android-only import behind `if platform == "android":`.
-- Persist save data under self.user_data_dir (App) / App.get_running_app().user_data_dir -- NEVER a relative path or cwd; Android sandboxes the working dir.
+- NEVER pass `id=` to any widget constructor (e.g. Button(id="go"), BoxLayout(id="root")). `id` is reserved for kv language and Kivy raises "Properties ['id'] passed to __init__ may not be existing property names". Keep a reference in a normal attribute instead: `self.go_btn = PillButton(...)`.
+- Persist data ONLY through the kit's Store: `Store.save(key, value)` and `value = Store.load(key, default)`. It returns the default when a key is missing, so a first launch (nothing saved yet) can't crash. NEVER use kivy.storage / JsonStore directly -- its `.get(key)` raises KeyError when missing and does NOT accept a `default=` argument.
+- Persist save data under self.user_data_dir (App) / App.get_running_app().user_data_dir -- NEVER a relative path or cwd; Android sandboxes the working dir. (Store already does this for you.)
+- Audio: `from kivy.core.audio import SoundLoader` -- NEVER `from kivy.audio import ...` (that module doesn't exist and crashes on desktop AND phone). The same goes for image/video/text/camera loaders: they live under kivy.core.* , not kivy.* .
 - Do NOT reference image/sound files that don't exist. Draw with kivy.graphics; generate any asset in code. Audio only via SoundLoader on a file you create at runtime, else skip sound.
 - Do NOT set Window.size or Window.fullscreen in code (Buildozer owns sizing/orientation). The launcher name + icon are set by Buildozer, not in code.
 
@@ -577,6 +584,8 @@ Common Android launch killers to check and fix:
 - Unguarded android-only imports (must be behind `if platform == "android":`).""" + """
 - A third-party import not listed in requirements (add it ONLY if it's in the allowed recipe set: pillow, requests, certifi, urllib3, idna, plyer, numpy; otherwise reimplement with stdlib/Kivy).
 - File writes to a relative path / cwd instead of user_data_dir.
+- `id=` passed to a widget constructor -> remove it, keep the reference in a normal attribute.
+- kivy.storage / JsonStore used directly (KeyError / no default=) -> switch to Store.save / Store.load(key, default).
 - References to image/sound files that don't exist (draw/generate instead).
 - Network calls without the INTERNET permission.
 - Setting Window.size / Window.fullscreen in code.
@@ -1083,6 +1092,49 @@ def kit_checks(tree, code, add, app_only=False):
                     % n.attr,
                     ("Use Theme.%s instead." % sug) if sug else
                     ("Valid attributes: " + ", ".join(THEME_ATTRS)))
+
+    # --- id= passed to a widget constructor (Kivy reserves 'id' for kv; always crashes) ---
+    _KIVY_WIDGETS = {
+        "Widget", "Button", "Label", "TextInput", "Image", "AsyncImage",
+        "BoxLayout", "FloatLayout", "GridLayout", "StackLayout", "AnchorLayout",
+        "RelativeLayout", "PageLayout", "ScrollView", "Screen", "ScreenManager",
+        "Slider", "Switch", "CheckBox", "Spinner", "ProgressBar", "ToggleButton",
+        "Popup", "ModalView", "Carousel", "TabbedPanel", "Scatter", "RecycleView",
+    }
+    _widgets = set(KIT_PUBLIC) | _KIVY_WIDGETS
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
+            continue
+        if n.func.id not in _widgets:
+            continue
+        for kw in n.keywords:
+            if kw.arg == "id":
+                add("error",
+                    "%s(id=...) -> Kivy raises \"Properties ['id'] ... may not be existing "
+                    "property names\". 'id' is reserved for kv." % n.func.id,
+                    "Drop id= and keep the reference in a plain attribute instead.")
+                break
+
+    # --- wrong kivy import paths (these submodules live under kivy.core; a bare path crashes) ---
+    _app_src = strip_kit(code)
+    for wrong in ("kivy.audio", "kivy.image", "kivy.video", "kivy.text", "kivy.camera",
+                  "kivy.spelling", "kivy.clipboard"):
+        if re.search(r"\b(from|import)\s+" + re.escape(wrong) + r"\b", _app_src):
+            right = "kivy.core." + wrong.split(".")[1]
+            add("error",
+                "'%s' is not a real module -> ModuleNotFoundError (crashes on desktop AND phone)"
+                % wrong,
+                "It lives under kivy.core -- use `%s` (e.g. from kivy.core.audio import SoundLoader)."
+                % right)
+
+    # --- kivy.storage / JsonStore used directly (KeyError / no default=; use Store instead) ---
+    # scan the APP only -- the kit's own Store helper legitimately uses JsonStore internally.
+    _appsrc = strip_kit(code)
+    if "JsonStore" in _appsrc or "kivy.storage" in _appsrc:
+        add("warn",
+            "using Kivy JsonStore/kivy.storage directly is crash-prone: .get(missing) raises "
+            "KeyError and takes no default=",
+            "Use the kit's Store: Store.save(key, value) and Store.load(key, default).")
 
     # --- wrong keyword on a kit constructor ---
     for n in ast.walk(tree):
@@ -2710,6 +2762,13 @@ def _missing_module(text):
     return m.group(1).split(".")[0] if m else None
 
 
+def _missing_module_full(text):
+    """The FULL dotted name of a missing import, e.g. 'kivy.audio' (not just 'kivy').
+    Critical for telling 'host lacks a whole package' from 'app used a bad submodule path'."""
+    m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", text or "")
+    return m.group(1) if m else None
+
+
 def _start_xvfb():
     """Start a private Xvfb on the first free display number and return (":N", proc).
     Used on Arch/CachyOS, whose xorg-server-xvfb ships Xvfb but not the xvfb-run wrapper.
@@ -2880,7 +2939,9 @@ def run_test(test_id, main_py, requirements):
 
     has_tb = "Traceback (most recent call last)" in out
     miss = _missing_module(out)
+    miss_full = _missing_module_full(out)
     failed = [p for p in phases if not p["ok"]]
+    reqs_set = {x.strip().lower() for x in (requirements or "").split(",")}
     if rc == 124 or "DAWG_TEST_TIMEOUT" in out:
         rec["status"] = "timeout"
         rec["summary"] = ("the app hung (no clean exit) -- likely a blocking loop or input() "
@@ -2888,7 +2949,21 @@ def run_test(test_id, main_py, requirements):
     elif miss and miss in ANDROID_ONLY:
         rec["status"] = "warn"
         rec["summary"] = "imports the android-only module '%s', which can't run on desktop. That's expected -- just make sure the import is guarded by `if platform == \"android\":` so desktop test runs (and the launch path) skip it." % miss
-    elif miss and miss in {x.strip().lower() for x in (requirements or "").split(",")} and miss in SAFE_REQS:
+    elif miss_full and "." in miss_full and miss == "kivy":
+        # Kivy IS installed (we run under a provisioned Kivy), so a missing kivy SUBMODULE means
+        # the app used an import path that doesn't exist. That is a real, on-device crash --
+        # NEVER wave it through as "host missing kivy". Point at the usual culprit.
+        hint = ""
+        if miss_full == "kivy.audio":
+            hint = " (SoundLoader lives in kivy.core.audio, not kivy.audio)"
+        elif miss_full in ("kivy.image", "kivy.video", "kivy.text", "kivy.camera"):
+            hint = " (that loader lives in kivy.core.%s)" % miss_full.split(".")[1]
+        rec["status"] = "fail"
+        rec["summary"] = ("bad Kivy import: '%s' doesn't exist%s. This crashes on the phone too. "
+                          "Fix the import path." % (miss_full, hint))
+        rec["error_text"] = out[-4000:]
+    elif miss and miss != "kivy" and miss in reqs_set and miss in SAFE_REQS:
+        # a declared THIRD-PARTY requirement isn't on the host but WILL be bundled by Buildozer
         rec["status"] = "warn"
         rec["summary"] = "host is missing '%s', so it couldn't be fully test-run here, but it IS declared and Buildozer will bundle it into the APK. Looks fine to build." % miss
     elif failed:
@@ -2934,8 +3009,8 @@ def _run_selftest_sync(main_py, requirements):
 def run_agent(job_id, desc, seed_payload=None, rounds=None):
     rec = JOBS[job_id]
     if rounds is None:
-        rounds = int(CONFIG.get("agent_rounds") or 3)
-    rounds = max(1, min(6, int(rounds)))
+        rounds = int(CONFIG.get("agent_rounds") or 5)
+    rounds = max(1, min(8, int(rounds)))
     try:
         # ---- round 0: get code on the table -------------------------------------
         if seed_payload is not None:
@@ -3863,32 +3938,35 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>THE DAWG // FORGE</title>
+<title>AndroDawg // APK Forge</title>
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <style>
   :root{
-    --bg:#06090d; --bg2:#0a0e13; --panel:#0d131b; --panel2:#121a24; --panel3:#17212e;
-    --line:#1d2a39; --line2:#2a3b4f;
-    --txt:#e6eef7; --muted:#7f92a6; --dim:#556274;
-    /* Dawg identity: Android green leads, cyan + violet support */
-    --green:#3ddc84; --green2:#2fc373; --greenGlow:rgba(61,220,132,.55);
-    --cyan:#38cdf0; --violet:#9282f7;
-    --danger:#ff5f6d; --amber:#ffb340;
-    --r:12px; --r2:16px;
-    --sh:0 1px 2px rgba(0,0,0,.45), 0 10px 30px -14px rgba(0,0,0,.75);
-    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"JetBrains Mono","DejaVu Sans Mono",monospace;
-    --ui:system-ui,-apple-system,"Segoe UI",Inter,Roboto,"Helvetica Neue",sans-serif;
+    /* theDawg design system, tuned for AndroDawg. The accent vars keep their old names but
+       now hold theDawg's palette -- amber leads, lime/cyan/mag support -- so the whole UI
+       flips to the terminal-IDE look in one place. */
+    --bg:#0c0e0f; --bg2:#101315; --panel:#15191b; --panel2:#1a1f22; --panel3:#20262a;
+    --line:#262d31; --line2:#31393e;
+    --txt:#e7eaeb; --muted:#8a9398; --dim:#6d767c;
+    --green:#e8a33d; --green2:#cf8a26; --greenGlow:rgba(232,163,61,.55);   /* amber (primary) */
+    --amber:#e8a33d; --ember:#e07a3a; --lime:#9fe04a;
+    --cyan:#46c7d4; --violet:#c79be0;
+    --danger:#e0594a;
+    --r:9px; --r2:13px;
+    --sh:0 1px 2px rgba(0,0,0,.35), 0 18px 46px -12px rgba(0,0,0,.7);
+    --mono:"JetBrains Mono","JetBrainsMono Nerd Font","Fira Code","Cascadia Code","Source Code Pro","Liberation Mono","DejaVu Sans Mono",ui-monospace,monospace;
+    --ui:"Inter","Inter Variable",system-ui,-apple-system,"Cantarell","Noto Sans","Segoe UI","Liberation Sans",sans-serif;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
   body{margin:0;background:
-      radial-gradient(1100px 620px at 82% -14%, rgba(61,220,132,.10), transparent 60%),
-      radial-gradient(920px 560px at 6% 2%, rgba(56,205,240,.06), transparent 58%),
+      radial-gradient(1100px 620px at 82% -14%, rgba(232,163,61,.08), transparent 60%),
+      radial-gradient(920px 560px at 6% 2%, rgba(70,199,212,.05), transparent 58%),
       var(--bg);
-    color:var(--txt);font-family:var(--ui);font-size:14.5px;line-height:1.55;
+    color:var(--txt);font-family:var(--ui);font-size:14px;line-height:1.55;
     -webkit-font-smoothing:antialiased}
-  ::selection{background:rgba(61,220,132,.30)}
+  ::selection{background:rgba(232,163,61,.28)}
 
   /* ---------- scrollbars ---------- */
   ::-webkit-scrollbar{width:11px;height:11px}
@@ -3900,24 +3978,25 @@ INDEX_HTML = r"""<!doctype html>
   header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;
     padding:11px 22px;border-bottom:1px solid var(--line);
     background:rgba(6,9,13,.82);backdrop-filter:blur(16px) saturate(160%)}
-  .brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.3px;font-size:15px}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.3px;font-size:15px;font-family:var(--mono)}
   .logo{width:34px;height:34px;border-radius:10px;flex:0 0 auto;object-fit:cover;
     background:linear-gradient(150deg,#0f1a14,#0a0e13);
     box-shadow:0 0 0 1px var(--greenGlow),0 6px 18px -6px var(--greenGlow);
     padding:2px}
   .brand .wm{display:flex;flex-direction:column;line-height:1.05}
-  .brand .wm b{font-size:15px;font-weight:800;letter-spacing:.5px}
-  .brand em{font-style:normal;color:var(--green)}
+  .brand .wm b{font-size:14px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+  .brand em{font-style:normal;color:var(--amber)}
   .brand .wm small{font-size:9.5px;letter-spacing:2.2px;color:var(--dim);font-weight:600;
     text-transform:uppercase;margin-top:1px}
-  .ver{font-size:10.5px;color:var(--green);font-weight:600;letter-spacing:1px;
-    border:1px solid rgba(61,220,132,.32);background:rgba(61,220,132,.08);
+  .ver{font-size:10px;color:var(--amber);font-weight:700;letter-spacing:.1em;
+    border:1px solid rgba(232,163,61,.32);background:rgba(232,163,61,.08);
     padding:2px 8px;border-radius:20px;font-family:var(--mono)}
   .grow{margin-left:auto}
   .hdr-tools{display:flex;align-items:center;gap:8px}
 
   /* ---------- generic bits ---------- */
-  main{max-width:1180px;margin:0 auto;padding:22px 22px 90px}
+  main{flex:1;display:grid;grid-template-columns:460px 1fr;min-height:0;max-width:none;margin:0;padding:0}
+  main>*{min-width:0;min-height:0}
   .panel{background:linear-gradient(180deg,var(--panel),var(--bg2));
     border:1px solid var(--line);border-radius:var(--r2);padding:18px;margin-bottom:18px;
     box-shadow:var(--sh)}
@@ -3929,8 +4008,8 @@ INDEX_HTML = r"""<!doctype html>
     width:100%;background:var(--panel2);color:var(--txt);border:1px solid var(--line);
     border-radius:var(--r);padding:11px 13px;font-family:var(--ui);font-size:13.5px;
     outline:none;transition:border-color .15s, box-shadow .15s}
-  textarea:focus,input:focus,select:focus{border-color:var(--green);
-    box-shadow:0 0 0 3px rgba(61,220,132,.14)}
+  textarea:focus,input:focus,select:focus{border-color:var(--amber);
+    box-shadow:0 0 0 2px rgba(232,163,61,.4)}
   textarea{resize:vertical}
   #desc{height:104px;font-size:14px;line-height:1.6}
   select{appearance:none;cursor:pointer;
@@ -3945,33 +4024,33 @@ INDEX_HTML = r"""<!doctype html>
   .hidden{display:none !important}
 
   /* ---------- buttons ---------- */
-  button{cursor:pointer;border:1px solid var(--line2);background:var(--panel3);
-    color:var(--txt);padding:10px 17px;border-radius:10px;font-family:var(--ui);
-    font-size:13px;font-weight:600;letter-spacing:.3px;transition:.14s;
+  button{cursor:pointer;border:1px solid var(--line);background:linear-gradient(180deg,#1b2023,#15191b);
+    color:var(--txt);padding:10px 17px;border-radius:var(--r);font-family:var(--ui);
+    font-size:13px;font-weight:600;letter-spacing:.2px;transition:.14s;
     display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
-  button:hover:not(:disabled){border-color:#3d5570;background:#1c2736;transform:translateY(-1px)}
-  button:active:not(:disabled){transform:translateY(0)}
-  button:disabled{opacity:.38;cursor:not-allowed}
-  button.primary{background:linear-gradient(180deg,#3ddc84,#2fc373);border-color:#2fc373;color:#04140b}
-  button.primary:hover:not(:disabled){box-shadow:0 8px 24px -8px var(--greenGlow);background:linear-gradient(180deg,#4ee996,#35cf7c)}
-  button.accent{background:linear-gradient(180deg,#38cdf0,#25a9d0);border-color:#25a9d0;color:#03151d}
-  button.accent:hover:not(:disabled){box-shadow:0 8px 24px -8px rgba(56,205,240,.7)}
-  button.violet{background:linear-gradient(180deg,#9282f7,#7261e6);border-color:#7261e6;color:#0b0720}
-  button.violet:hover:not(:disabled){box-shadow:0 8px 24px -8px rgba(146,130,247,.7)}
-  button.warn{background:#2a2010;border-color:#5d4820;color:var(--amber)}
+  button:hover:not(:disabled){border-color:var(--amber);color:#fff;transform:translateY(-1px)}
+  button:active:not(:disabled){transform:translateY(1px)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:var(--amber);border-color:var(--amber);color:#1c1407;font-weight:700}
+  button.primary:hover:not(:disabled){filter:brightness(1.08);box-shadow:0 8px 24px -8px var(--greenGlow)}
+  button.accent{background:linear-gradient(180deg,#1b2023,#15191b);border-color:var(--line);color:var(--cyan)}
+  button.accent:hover:not(:disabled){border-color:var(--cyan);color:#fff;box-shadow:0 8px 24px -10px rgba(70,199,212,.6)}
+  button.violet{background:linear-gradient(180deg,#1b2023,#15191b);border-color:var(--line);color:var(--violet)}
+  button.violet:hover:not(:disabled){border-color:var(--violet);color:#fff}
+  button.warn{background:#241a0c;border-color:#5d4820;color:var(--amber)}
   button.ghost{background:transparent}
-  button.sm{padding:7px 12px;font-size:12px;border-radius:9px}
-  .chip{padding:7px 13px;font-size:12.5px;border-radius:20px;font-weight:500;
-    background:var(--panel2);border-color:var(--line)}
-  .chip:hover:not(:disabled){border-color:var(--green);color:var(--green)}
+  button.sm{padding:7px 12px;font-size:12px;border-radius:var(--r)}
+  .chip{padding:7px 13px;font-size:11.5px;border-radius:var(--r);font-weight:600;font-family:var(--mono);
+    letter-spacing:.02em;background:var(--panel2);border-color:var(--line)}
+  .chip:hover:not(:disabled){border-color:var(--amber);color:var(--amber);background:rgba(232,163,61,.07)}
 
   /* ---------- notice banner ---------- */
   .notice{border:1px solid var(--line2);border-left:3px solid var(--amber);
-    background:linear-gradient(180deg,rgba(255,179,64,.08),transparent);
+    background:linear-gradient(180deg,rgba(232,163,61,.08),transparent);
     border-radius:var(--r);padding:11px 14px;margin-bottom:16px;font-size:13px;
     color:var(--txt);display:flex;align-items:center;gap:8px;flex-wrap:wrap;line-height:1.5}
-  .notice.work{border-left-color:var(--green);background:linear-gradient(180deg,rgba(61,220,132,.08),transparent);color:var(--muted)}
-  .notice.bad{border-left-color:var(--danger);background:linear-gradient(180deg,rgba(255,95,109,.08),transparent)}
+  .notice.work{border-left-color:var(--lime);background:linear-gradient(180deg,rgba(159,224,74,.08),transparent);color:var(--muted)}
+  .notice.bad{border-left-color:var(--danger);background:linear-gradient(180deg,rgba(224,89,74,.08),transparent)}
 
   /* ---------- tabs ---------- */
   .tabs{display:inline-flex;gap:4px;padding:4px;background:var(--panel);
@@ -3979,8 +4058,7 @@ INDEX_HTML = r"""<!doctype html>
   .tab{padding:8px 20px;border-radius:9px;color:var(--muted);cursor:pointer;
     font-weight:600;font-size:13px;transition:.15s;user-select:none;letter-spacing:.3px}
   .tab:hover{color:var(--txt)}
-  .tab.active{color:#04140b;background:linear-gradient(180deg,var(--green),var(--green2));
-    box-shadow:0 4px 14px -6px var(--greenGlow)}
+  .tab.active{color:#1c1407;background:var(--amber);box-shadow:0 4px 14px -6px var(--greenGlow);font-weight:700}
 
   /* ---------- status pills ---------- */
   .pills{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
@@ -3988,7 +4066,7 @@ INDEX_HTML = r"""<!doctype html>
     border:1px solid var(--line);border-radius:20px;color:var(--muted);
     background:var(--panel2);font-family:var(--mono);white-space:nowrap}
   .pill b{color:var(--txt);font-weight:650}
-  .pill.ok{color:var(--green);border-color:rgba(61,220,132,.35);background:rgba(61,220,132,.09)}
+  .pill.ok{color:var(--lime);border-color:rgba(159,224,74,.35);background:rgba(159,224,74,.09)}
   .pill.bad{color:var(--danger);border-color:rgba(255,95,109,.35);background:rgba(255,95,109,.09)}
   .pill.warn{color:var(--amber);border-color:rgba(255,179,64,.32);background:rgba(255,179,64,.09)}
   .pill.info{color:var(--cyan);border-color:rgba(67,200,245,.3);background:rgba(67,200,245,.08)}
@@ -4007,7 +4085,7 @@ INDEX_HTML = r"""<!doctype html>
   .editor{position:relative;border:1px solid var(--line);border-radius:var(--r);
     background:#070b10;overflow:hidden;display:flex;height:480px;min-height:180px;
     resize:vertical;box-shadow:inset 0 1px 0 rgba(255,255,255,.03)}
-  .editor:focus-within{border-color:var(--green);box-shadow:0 0 0 3px rgba(61,220,132,.12)}
+  .editor:focus-within{border-color:var(--amber);box-shadow:0 0 0 2px rgba(232,163,61,.35)}
   .gutter{flex:0 0 auto;height:100%;padding:13px 10px 13px 14px;text-align:right;color:#39485c;
     font-family:var(--mono);font-size:12.5px;line-height:1.65;user-select:none;
     background:#080d13;border-right:1px solid var(--line);overflow:hidden;min-width:54px}
@@ -4031,7 +4109,7 @@ INDEX_HTML = r"""<!doctype html>
   .sev.error{color:#ffd0d4;background:rgba(255,95,109,.18);border:1px solid rgba(255,95,109,.34)}
   .sev.warn{color:#ffe2b8;background:rgba(255,179,64,.15);border:1px solid rgba(255,179,64,.32)}
   .sev.info{color:#c4e9fb;background:rgba(67,200,245,.14);border:1px solid rgba(67,200,245,.3)}
-  .sev.ok{color:#c2f5da;background:rgba(61,220,132,.14);border:1px solid rgba(61,220,132,.32)}
+  .sev.ok{color:#d3f5a8;background:rgba(159,224,74,.14);border:1px solid rgba(159,224,74,.32)}
   .issue .fix{color:var(--dim);font-size:12px;margin-top:3px}
   .issue .fix b{color:var(--cyan);font-weight:600}
 
@@ -4051,7 +4129,7 @@ INDEX_HTML = r"""<!doctype html>
   .phases{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
   .ph{display:flex;align-items:center;gap:6px;font-size:11.5px;padding:5px 10px;
     border-radius:8px;font-family:var(--mono);border:1px solid var(--line);background:var(--panel2)}
-  .ph.ok{color:var(--green);border-color:rgba(61,220,132,.3);background:rgba(61,220,132,.08)}
+  .ph.ok{color:var(--lime);border-color:rgba(159,224,74,.3);background:rgba(159,224,74,.08)}
   .ph.bad{color:var(--danger);border-color:rgba(255,95,109,.35);background:rgba(255,95,109,.1)}
 
   /* ---------- logs ---------- */
@@ -4087,7 +4165,7 @@ INDEX_HTML = r"""<!doctype html>
   /* ---------- toasts ---------- */
   #toasts{position:fixed;right:20px;bottom:20px;z-index:80;display:flex;
     flex-direction:column;gap:9px;align-items:flex-end}
-  .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--green);
+  .toast{background:var(--panel3);border:1px solid var(--line2);border-left:3px solid var(--amber);
     border-radius:11px;padding:11px 16px;font-size:13px;max-width:400px;
     box-shadow:0 14px 40px -14px rgba(0,0,0,.9);animation:tin .22s ease-out}
   .toast.ok{border-left-color:var(--green)}
@@ -4111,31 +4189,82 @@ INDEX_HTML = r"""<!doctype html>
     display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .empty{text-align:center;padding:44px 20px;color:var(--dim)}
   .empty .big{font-size:38px;opacity:.35;margin-bottom:10px}
+
+  /* ===== theDawg app-shell: titlebar / top / steprail / two-column main ===== */
+  body{display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  .titlebar{display:flex;align-items:center;padding:0 12px;height:34px;flex:0 0 auto;
+    background:linear-gradient(180deg,#0f1416,#0a0d0e);border-bottom:1px solid var(--line);z-index:6}
+  .tb-traffic{display:flex;gap:8px}
+  .tl{width:12px;height:12px;border-radius:50%}
+  .tl-close{background:#e0594a;cursor:pointer}.tl-close:hover{filter:brightness(1.25);box-shadow:0 0 8px #e0594a}
+  .tl-min{background:var(--amber)}.tl-max{background:#3a4248}
+  .tb-title{flex:1;text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--dim)}
+  .tb-title .tb-sub{color:var(--dim);opacity:.7}
+  .tb-right{width:56px;text-align:right}.tb-status{color:var(--lime);font-size:10px}
+  .top{display:flex;align-items:center;gap:14px;padding:9px 16px;flex:0 0 auto;
+    background:linear-gradient(180deg,rgba(23,28,31,.94),rgba(17,22,24,.6));
+    border-bottom:1px solid var(--line);z-index:5}
+  .top .logo{display:flex;align-items:center;gap:10px}
+  .top .logo img{width:28px;height:28px;border-radius:var(--r2);box-shadow:0 0 0 1px #0006,0 4px 14px rgba(232,163,61,.22)}
+  .top .logo .name{font-weight:650;font-size:16px}.top .logo .name b{color:var(--amber)}
+  .tool-chip{display:flex;align-items:center;gap:8px;padding:5px 11px;border-radius:var(--r2);
+    background:var(--panel);border:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .tool-chip .fn{color:var(--muted)}
+  .badge{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;font-weight:700;padding:3px 7px;border-radius:5px;text-transform:uppercase}
+  .badge.ver{background:rgba(120,160,255,.14);color:#9ab6ff;border:1px solid rgba(120,160,255,.3);text-transform:none}
+  .badge.testing{background:rgba(232,163,61,.14);color:var(--amber);border:1px solid rgba(232,163,61,.3)}
+  .spacer{flex:1}
+  .icon-btn{background:var(--panel);border:1px solid var(--line);border-radius:var(--r2);color:var(--muted);
+    width:34px;height:34px;padding:0;cursor:pointer;font-size:15px;display:grid;place-items:center}
+  .icon-btn:hover{color:var(--txt);border-color:var(--amber);background:rgba(232,163,61,.06);transform:none}
+  .steprail{display:flex;align-items:center;gap:8px;padding:8px 16px;flex:0 0 auto;
+    background:linear-gradient(180deg,rgba(15,20,22,.92),rgba(12,15,16,.55));border-bottom:1px solid var(--line)}
+  .steprail .step{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;
+    letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
+  .steprail .step i{display:grid;place-items:center;width:16px;height:16px;border-radius:50%;
+    border:1px solid var(--line);font-style:normal;font-size:9px;font-weight:700;color:var(--dim);background:var(--panel)}
+  .steprail .step.on{color:var(--amber)}
+  .steprail .step.on i{border-color:var(--amber);color:#1c1407;background:var(--amber);box-shadow:0 0 0 3px rgba(232,163,61,.16)}
+  .steprail .step.done{color:var(--lime)}
+  .steprail .step.done i{border-color:var(--lime);color:#11210a;background:var(--lime)}
+  .steprail .sep{flex:0 1 26px;height:1px;background:var(--line)}
+  .dialogue{display:flex;flex-direction:column;overflow:auto;padding:16px;
+    border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(16,19,21,.5),rgba(12,14,15,.3))}
+  .dlg-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+  .dlg-h .t{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+  .work{overflow:auto;padding:16px}
+  .dialogue .panel,.work .panel{box-shadow:none}
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">
-    <img class="logo" src="/icon.png" alt="The Dawg">
-    <div class="wm">
-      <b>THE DAWG <em>// FORGE</em></b>
-      <small>describe an app &middot; get a real apk</small>
-    </div>
-    <span class="ver">v3.1</span>
+<div class="titlebar">
+  <div class="tb-traffic"><span class="tl tl-close" onclick="quitApp()" title="Quit"></span><span class="tl tl-min"></span><span class="tl tl-max"></span></div>
+  <div class="tb-title"><span class="tb-glyph">⬢</span> AndroDawg <span class="tb-sub">&mdash; Android toolsmith</span></div>
+  <div class="tb-right"><span class="tb-status" id="tbStatus">●</span></div>
+</div>
+<div class="top">
+  <div class="logo"><img src="/icon.png" alt=""><span class="name"><b>Andro</b>Dawg</span></div>
+  <div class="tool-chip" id="toolChip"><span class="fn" id="fileName">untitled.py</span><span class="badge ver">v3.1</span><span class="badge testing">apk</span></div>
+  <span class="spacer"></span>
+  <div class="docwrap">
+    <span class="pill" id="docsum" onclick="toggleDoctor()"><span class="dot"></span>checking...</span>
+    <div id="doctor"></div>
   </div>
-  <span class="grow"></span>
-  <div class="hdr-tools">
-    <div class="docwrap">
-      <span class="pill" id="docsum" onclick="toggleDoctor()"><span class="dot"></span>checking...</span>
-      <div id="doctor"></div>
-    </div>
-    <span class="pill info" id="tokpill" title="tokens used this session"><span class="dot"></span><b>0</b> tok</span>
-    <button class="sm ghost" onclick="openSettings()">&#9881;&#xFE0E; Settings</button>
-    <button class="sm ghost" onclick="quitApp()">Quit</button>
-  </div>
-</header>
+  <span class="pill info" id="tokpill" title="tokens used this session"><span class="dot"></span><b>0</b> tok</span>
+  <button class="icon-btn" onclick="openSettings()" title="Settings">&#9881;&#xFE0E;</button>
+  <button class="icon-btn" onclick="quitApp()" title="Quit">&#9211;</button>
+</div>
+<div class="steprail" id="stepRail">
+  <span class="step on" data-step="describe"><i>1</i> describe</span><span class="sep"></span>
+  <span class="step" data-step="check"><i>2</i> crash-check</span><span class="sep"></span>
+  <span class="step" data-step="fix"><i>3</i> fix</span><span class="sep"></span>
+  <span class="step" data-step="build"><i>4</i> build apk</span>
+</div>
 
 <main>
+ <div class="dialogue">
+  <div class="dlg-h"><span class="t">build request</span></div>
   <div class="tabs">
     <div class="tab active" id="tab_ai" onclick="setMode('ai')">AI FORGE</div>
     <div class="tab" id="tab_manual" onclick="setMode('manual')">MANUAL</div>
@@ -4174,6 +4303,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  </div><!-- /dialogue -->
+ <div class="work">
   <!-- ============ Workspace ============ -->
   <div class="panel hidden" id="out">
     <div class="notice hidden" id="crashbanner"></div>
@@ -4283,6 +4414,7 @@ INDEX_HTML = r"""<!doctype html>
       <button id="apkBtn" class="accent sm hidden" onclick="downloadApk()">&#8595; Download APK</button></div>
     <div class="log" id="log"></div>
   </div>
+ </div><!-- /work -->
 </main>
 
 <!-- ============ Settings ============ -->

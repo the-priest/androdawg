@@ -64,6 +64,36 @@ the build proceeded anyway. So you'd wait ~20 minutes for an APK that fails on t
   replying in prose instead of code) instead of a toast that flashes and vanishes -- and your
   current app is left untouched so nothing is lost.
 
+## Critical: no more false "looks fine to build" (this build)
+- **The self-test was waving through a guaranteed-crash app.** An app importing `kivy.audio`
+  (which doesn't exist -- SoundLoader is in `kivy.core.audio`) failed the import phase, but the
+  classifier collapsed the missing module `kivy.audio` to its top package `kivy`, saw "kivy is
+  declared", and reported "host is missing kivy ... looks fine to build." That's the exact
+  ship-a-broken-APK failure. Fixed: a missing kivy SUBMODULE is now always a FAIL (Kivy IS
+  installed, so the import path is wrong); only a genuinely missing declared THIRD-PARTY
+  package (requests, pillow, ...) is treated as "will be bundled".
+- **Caught at generation + statically too.** Wrong kivy paths (kivy.audio/image/video/text/
+  camera/clipboard/spelling) are now a static ERROR with the correct kivy.core.* path, and the
+  prompt tells the model to use `from kivy.core.audio import SoundLoader`.
+- Verified end-to-end: an app importing kivy.audio now returns FAIL with the exact fix, not a
+  false green; a missing declared dep like requests still correctly reads as "will bundle".
+
+## Generation reliability -- kill the recurring Kivy mistakes (this build)
+The model (DeepSeek) kept making the same three Kivy errors, which the self-test caught one
+per fix-round until it ran out. Fixed at the source so apps build clean far more often:
+- **Crash-proof Store in the kit.** `Store.save(key, value)` / `Store.load(key, default)` --
+  JSON persistence in user_data_dir that returns the default when a key is missing, so a first
+  launch can't crash. Replaces direct kivy.storage/JsonStore use (whose .get raises KeyError
+  and takes no default=). Advertised to the model in the API reference.
+- **Static catches, before the self-test:** `Widget(id=...)` (Kivy reserves id for kv -> the
+  "Properties ['id'] may not be existing property names" crash) is now a hard error, and
+  direct JsonStore use is warned with the Store fix. Both are caught in ~1s instead of costing
+  a whole 5-second fix round. The id= check is scoped to real widgets so a custom class with
+  an id argument isn't false-flagged; the JsonStore check scans the app only (the kit's own
+  Store uses JsonStore internally, correctly).
+- **Prompt guidance** added for both, plus the fix-prompt now lists them as things to correct.
+- **Fix rounds raised 3 -> 5** (cap 8) so a multi-bug app converges instead of running out.
+
 ## Hardening pass -- fail fast, fail clear (this build)
 Goal: never wait 20-40 minutes to hit an error that could be caught in 2 seconds.
 - **Build-tool preflight.** Before a build starts, every host command p4a needs to compile the
