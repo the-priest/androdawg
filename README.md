@@ -62,7 +62,7 @@ Everything runs **locally**. Your API key never leaves your machine.
 From a clone (recommended while iterating):
 
 ```
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/the-priest/androdawg/main/install.sh | bash
 ```
 
 The installer needs **no root** — everything lands under `$HOME`. It:
