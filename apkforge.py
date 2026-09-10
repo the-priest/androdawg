@@ -58,11 +58,25 @@ HOST = "127.0.0.1"
 PORT = 8731
 
 SF_URL = "https://api.siliconflow.cn/v1/chat/completions"
-SF_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+SF_MODEL = "zai-org/GLM-5.3-Flash"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-VERSION = "3.1"
+VERSION = "4.0"
+
+# GLM-5.3-Flash is a "always-thinking" model: its chat template opens a <think>
+# block in the GENERATION PROMPT, so the model ALWAYS reasons and the reasoning is
+# NOT optional. Two things fall out of that and both are handled in call_ai:
+#   1) reasoning burns output budget, and a code generator wants CODE not a plan, so
+#      we ask for the smallest reasoning the model will do (reasoning_effort=low) and
+#      run a bigger max_tokens so the app itself never gets truncated by the CoT.
+#   2) the reasoning can leak into `content` as a <think>...</think> block or, because
+#      the block is opened in the prompt, as an ORPHANED trailing </think>. If we let
+#      that reach the section parser it becomes part of main.py -> a broken app. So we
+#      strip it (strip_think) and prefer the provider's separate reasoning_content field.
+# reasoning_effort enum for GLM-5.3 is low|high|max and DEFAULTS TO max if omitted or
+# set to anything else -- so it MUST be sent explicitly or every call runs at max.
+GLM_REASONING_EFFORTS = ("low", "high", "max")
 
 WORKDIR = os.path.expanduser("~/AndroDawg")
 PROJECTS = os.path.join(WORKDIR, "projects")
@@ -139,7 +153,11 @@ DEFAULT_CONFIG = {
     "sf_model": SF_MODEL, "sf_url": SF_URL,
     "groq_model": GROQ_MODEL, "groq_url": GROQ_URL,
     # --- efficiency knobs (all about not burning tokens) ---
-    "max_tokens": 12000,      # per-call output ceiling
+    # 20000, not 12000: GLM-5.3 always spends some output budget on reasoning before it
+    # writes the app, so a tight ceiling truncates the app mid-file. The reasoning is
+    # stripped from what we keep, but it still has to fit while streaming.
+    "max_tokens": 20000,      # per-call output ceiling
+    "reasoning_effort": "low",  # GLM only: low|high|max. low = "write code, don't over-plan"
     "token_budget": 0,        # 0 = unlimited; otherwise a hard session cap
     "cache": True,            # reuse identical prior responses for free
     "auto_repair": True,      # fix what we can locally before ever calling the AI
@@ -593,6 +611,22 @@ Common Android launch killers to check and fix:
 
 Change as little as possible -- fix the fault, do not rewrite working code, do not add features, do not explain. Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the corrected APP CODE ONLY in <<<MAIN_PY>>>. No kit, no prose, no fences."""
 
+EDIT_PROMPT = """You are The Dawg (APK edition), an elite Android app smith. You are handed the APP portion of a working single-file Kivy app and a plain-English change the user wants. Make EXACTLY that change, keep everything else working, and return the COMPLETE updated app.
+
+""" + _KIT_CONTRACT + """
+You are shown the app code ONLY -- the kit sits above it, unchanged and already in scope. Return the app code ONLY. Never output the kit; if you do, the round is wasted.
+
+HOW TO EDIT
+- Do the requested change fully and correctly -- if it needs a new screen, widget, setting, or bit of logic, add it properly using the kit components (Scaffold/Card/PillButton/Chip/Meter/TextField/Store).
+- Do NOT break or drop existing features. Do NOT rewrite unrelated code, rename the app, or restyle things the user didn't ask about. Preserve the class name and the run() call.
+- Return the WHOLE app every time (not a diff, not a snippet) -- the entire file replaces the old one.
+- Keep it Kivy-only; keep every android-only import behind `if platform == "android":`; keep saves going through Store / user_data_dir; never set Window.size.
+- Never pass `id=` to a widget. Only use kit attributes/keywords that exist (see the API list above).
+- requirements/permissions: change them ONLY if the edit genuinely needs it, and only from the allowed recipe set (pillow, requests, certifi, urllib3, idna, plyer, numpy). Declare INTERNET if you add a network call.
+- No placeholders, no TODO, no "...". Real working code top to bottom. No commentary.
+
+Output EXACTLY the same section format you were given (<<<NAME>>> ... <<<END>>>) with the full updated APP CODE ONLY in <<<MAIN_PY>>>. No kit, no prose, no fences."""
+
 # ----------------------------------------------------------------- helpers
 def slugify(s):
     s = re.sub(r"[^a-zA-Z0-9]+", "_", (s or "").strip()).strip("_").lower()
@@ -653,6 +687,76 @@ def strip_fence(s):
         if s.rstrip().endswith("```"):
             s = s.rstrip()[:-3]
     return s.strip()
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def strip_think(text):
+    """Remove a thinking model's chain-of-thought so it never reaches the section parser.
+
+    GLM-5.3-Flash cannot turn thinking off; its chat template opens the <think> block in
+    the generation prompt, so a reply can arrive as any of:
+      * `<think> ... </think>` then the real answer     (both tags present)
+      * ` ...reasoning... </think>` then the real answer (ORPHANED closer -- the opener
+        was in the prompt, so the model only emits the closing tag)
+      * `<think> ...reasoning...` with NO closer         (truncated mid-thought -> no answer)
+    Left in place, that reasoning becomes part of main.py and the app is garbage. This
+    returns ONLY the answer. It is deliberately conservative about the orphaned case so a
+    reply that merely mentions the tag in prose is not mangled."""
+    if not text:
+        return text
+    t = _THINK_BLOCK.sub("", text)
+    low = t.lower()
+    has_open = "<think>" in low
+    # The section markers (<<<NAME>>> etc.) are the real answer. A think tag only ever
+    # counts as reasoning when it sits BEFORE them; a "</think>" that somehow appears
+    # inside the emitted code must never truncate the app.
+    marker = t.find("<<<")
+    if not has_open and "</think>" in low:
+        # orphaned closer: the template opened the block in the prompt, so output begins
+        # inside reasoning and only the closer is emitted. Drop up to and including it.
+        cut = low.find("</think>")
+        if marker == -1 or cut < marker:
+            t = t[cut + len("</think>"):]
+    elif has_open and "</think>" not in low:
+        cut = low.find("<think>")
+        if marker == -1 or cut < marker:
+            # opener, no closer, and nothing but reasoning after it -> no answer here.
+            t = t[:cut]
+    return t.strip()
+
+
+def content_of(resp):
+    """Pull the assistant's answer out of a chat-completions response, reasoning removed.
+
+    Thinking models on SiliconFlow return the chain of thought in a SEPARATE
+    `reasoning_content` field and the answer in `content`; we want `content`. But some
+    backends (and forced/edge cases) instead inline the CoT into `content` as a <think>
+    block -- strip_think handles that. Returns "" when the model reasoned but produced no
+    answer (the 'reasoned-silent' case call_ai then retries)."""
+    try:
+        msg = (resp.get("choices") or [{}])[0].get("message") or {}
+    except Exception:
+        return ""
+    return strip_think(msg.get("content") or "")
+
+
+def reasoning_params(model, effort=None):
+    """Reasoning knobs for a thinking model, empty for everything else.
+
+    GLM-5.3 defaults to MAX reasoning if reasoning_effort is absent, so a code generator
+    must send it explicitly or pay for max reasoning on every call. We send both dialects:
+    Z.ai/vLLM read `reasoning_effort`; SiliconFlow's own API reads `enable_thinking` +
+    `thinking_budget`. They agree in direction; if a backend rejects the extra keys the
+    caller strips them and retries (see call_ai)."""
+    if "glm" not in (model or "").lower():
+        return {}
+    eff = (effort or CONFIG.get("reasoning_effort") or "low").lower()
+    if eff not in GLM_REASONING_EFFORTS:
+        eff = "low"
+    budget = {"low": 2048, "high": 8192, "max": 24576}[eff]
+    return {"reasoning_effort": eff, "enable_thinking": True, "thinking_budget": budget}
 
 
 def syntax_check(code):
@@ -1383,7 +1487,9 @@ def compose(app_code):
 def build_forge_payload(text, desc):
     """Parse a model response into a forge payload. Never raises; always returns a dict.
     main_py here is the APP code as the model wrote it (kit is added later in handle_forge)."""
-    text = text or ""
+    # Defence in depth: call_ai already strips reasoning, but anything reaching the parser
+    # with a leftover <think> block (a direct/legacy caller) would fold it into main.py.
+    text = strip_think(text or "")
     sec = parse_sections(text)
     main_py = strip_fence(sec.get("main_py", ""))
     if not main_py:
@@ -2089,6 +2195,25 @@ def _post_json_resilient(url, key, payload, tries=3):
         raise last                  # defensive; loop above always returns or raises
 
 
+def _chat_completion(url, key, model, messages, temperature, max_tokens, effort=None):
+    """One chat-completions call carrying model-aware reasoning params.
+
+    If a strict backend rejects the reasoning keys with an HTTP 400, retry ONCE without
+    them -- the model still answers (at its own default reasoning) instead of the whole
+    round dying on an unrecognised field."""
+    base = {"model": model, "messages": messages,
+            "temperature": temperature, "max_tokens": max_tokens}
+    rp = reasoning_params(model, effort)
+    if not rp:
+        return _post_json_resilient(url, key, base)
+    try:
+        return _post_json_resilient(url, key, dict(base, **rp))
+    except urllib.error.HTTPError as e:
+        if e.code == 400:
+            return _post_json_resilient(url, key, base)
+        raise
+
+
 def est_tokens(text):
     """Cheap token estimate (~4 chars/token) for pre-flight sizing and cache stats."""
     return max(1, len(text or "") // 4)
@@ -2200,11 +2325,21 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call", no_cache=F
     if sf:
         sf_u = chat_url(CONFIG.get("sf_url") or SF_URL)
         try:
-            d = _post_json_resilient(sf_u, sf, {
-                "model": model, "messages": messages,
-                "temperature": temperature, "max_tokens": max_tokens,
-            })
-            text = d["choices"][0]["message"]["content"]
+            d = _chat_completion(sf_u, sf, model, messages, temperature, max_tokens)
+            text = content_of(d)
+            if not text and "glm" in (model or "").lower():
+                # reasoned-silent: GLM spent the whole budget thinking and emitted no
+                # answer. Re-ask with minimal reasoning, more room, and an explicit
+                # "answer now" -- reproducing the identical request would only loop.
+                nudge = list(messages) + [{"role": "user",
+                    "content": "Output the required result now, in full. Do NOT think "
+                               "further -- write the answer directly."}]
+                d = _chat_completion(sf_u, sf, model, nudge, temperature,
+                                     min(32000, max(max_tokens, 24000)), effort="low")
+                text = content_of(d)
+            if not text:
+                raise RuntimeError("the model returned only reasoning and no answer -- "
+                                   "hit it again, or simplify the request")
             u = d.get("usage") or {}
             meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
                   u.get("completion_tokens") or est_tokens(text))
@@ -2219,11 +2354,8 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call", no_cache=F
         gq_u = chat_url(CONFIG.get("groq_url") or GROQ_URL)
         gq_model = CONFIG.get("groq_model") or GROQ_MODEL
         try:
-            d = _post_json_resilient(gq_u, gq, {
-                "model": gq_model, "messages": messages,
-                "temperature": temperature, "max_tokens": max_tokens,
-            })
-            text = d["choices"][0]["message"]["content"]
+            d = _chat_completion(gq_u, gq, gq_model, messages, temperature, max_tokens)
+            text = content_of(d)
             u = d.get("usage") or {}
             meter(u.get("prompt_tokens") or est_tokens("".join(m.get("content") or "" for m in messages)),
                   u.get("completion_tokens") or est_tokens(text))
@@ -2354,6 +2486,24 @@ def ai_polish(main_py, requirements, permissions):
     messages = [{"role": "system", "content": POLISH_PROMPT}, {"role": "user", "content": msg}]
     text, provider = call_ai(messages, temperature=0.35, label="polish")
     payload = build_forge_payload(text, "polish")
+    return _finish_ai(payload, provider, requirements, permissions)
+
+
+def ai_edit(main_py, instruction, requirements, permissions):
+    """Apply a plain-English change to the current app. Powers the Station: 'add a dark
+    mode toggle', 'make the buttons bigger', 'add a second screen for settings', 'store
+    the high score'. Sends APP CODE ONLY (the 300-line kit never crosses the wire) and
+    gets the full modified app back in the usual section format."""
+    app = strip_kit(main_py or "")
+    msg = ("CHANGE THE USER WANTS:\n" + (instruction or "(none)")
+           + "\n\nDECLARED requirements: " + (requirements or "python3,kivy")
+           + "\nDECLARED permissions: " + (permissions or "(none)")
+           + "\n\nCURRENT APP CODE (the kit sits above this, unchanged and in scope):\n" + app)
+    messages = [{"role": "system", "content": EDIT_PROMPT}, {"role": "user", "content": msg}]
+    # no_cache: editing is iterative -- the same instruction on the same code should still
+    # act, not replay a cached answer and look like it did nothing.
+    text, provider = call_ai(messages, temperature=0.3, label="edit", no_cache=True)
+    payload = build_forge_payload(text, instruction)
     return _finish_ai(payload, provider, requirements, permissions)
 
 
@@ -3124,6 +3274,49 @@ def run_agent(job_id, desc, seed_payload=None, rounds=None):
         rec["usage"] = dict(USAGE)
 
 
+def run_station(job_id, instruction, current_main_py="", requirements="",
+                permissions="", rounds=None):
+    """The Station's brain: ONE natural-language box that does the right thing.
+
+    Empty editor  -> forge a brand-new app from the instruction, then verify it.
+    App in editor -> apply the instruction as an EDIT to that app, then verify it.
+    Either way the same forge -> repair -> lint -> self-test -> fix loop runs to
+    completion, so whatever lands back in the editor has already been checked. This is
+    what makes the tool a 'station': the user just says what they want in plain English
+    and the build/update/fix cycle happens for them."""
+    rec = JOBS[job_id]
+    cur = strip_kit(current_main_py or "").strip()
+    if not cur:
+        _job_log(rec, "empty editor -> forging a new app from your instruction", "step")
+        return run_agent(job_id, instruction, rounds=rounds)
+    short = instruction.strip().replace("\n", " ")
+    _job_log(rec, "editing the current app: " + (short[:140] + ("..." if len(short) > 140 else "")), "step")
+    try:
+        edited = ai_edit(current_main_py, instruction, requirements, permissions)
+    except Exception as e:
+        rec["status"] = "failed"
+        rec["error"] = str(e)
+        _job_log(rec, "edit call failed: %s" % e, "fail")
+        rec["usage"] = dict(USAGE)
+        return
+    if not edited.get("ok"):
+        rec["status"] = "failed"
+        rec["error"] = edited.get("error", "the model's edit didn't parse")
+        _job_log(rec, rec["error"], "fail")
+        rec["usage"] = dict(USAGE)
+        return
+    if strip_kit(edited["main_py"]).strip() == cur:
+        _job_log(rec, "the model returned the app unchanged -- it didn't apply that edit. "
+                      "Try wording the change differently or more specifically.", "warn")
+        rec["status"] = "stalled"
+        rec["payload"] = edited
+        rec["usage"] = dict(USAGE)
+        return
+    _job_log(rec, "change applied via %s -- now verifying" % edited.get("provider", "AI"), "ok")
+    # Hand the edited app to the exact same verify loop a fresh forge uses.
+    return run_agent(job_id, instruction, seed_payload=edited, rounds=rounds)
+
+
 # ----------------------------------------------------------------- server helpers
 def safe_archs(a):
     known = {"arm64-v8a", "armeabi-v7a", "x86", "x86_64"}
@@ -3306,7 +3499,8 @@ class H(BaseHTTPRequestHandler):
                 "sf_url": CONFIG.get("sf_url") or SF_URL,
                 "groq_model": CONFIG.get("groq_model") or GROQ_MODEL,
                 "groq_url": CONFIG.get("groq_url") or GROQ_URL,
-                "max_tokens": int(CONFIG.get("max_tokens") or 12000),
+                "max_tokens": int(CONFIG.get("max_tokens") or 20000),
+                "reasoning_effort": CONFIG.get("reasoning_effort") or "low",
                 "token_budget": int(CONFIG.get("token_budget") or 0),
                 "cache": bool(CONFIG.get("cache", True)),
                 "auto_repair": bool(CONFIG.get("auto_repair", True)),
@@ -3331,6 +3525,8 @@ class H(BaseHTTPRequestHandler):
             return self.handle_forge(body)
         if path == "/api/autoforge":
             return self.handle_autoforge(body)
+        if path == "/api/station":
+            return self.handle_station(body)
         if path == "/api/lint":
             return self.handle_lint(body)
         if path == "/api/repair":
@@ -3391,6 +3587,8 @@ class H(BaseHTTPRequestHandler):
                     CONFIG[k] = max(lo, min(hi, int(body[k] or 0)))
                 except Exception:
                     pass
+        if (body.get("reasoning_effort") or "").strip().lower() in GLM_REASONING_EFFORTS:
+            CONFIG["reasoning_effort"] = body["reasoning_effort"].strip().lower()
         for k in ("cache", "auto_repair"):
             if k in body:
                 CONFIG[k] = bool(body[k])
@@ -3454,6 +3652,23 @@ class H(BaseHTTPRequestHandler):
                          args=(jid, desc, seed, body.get("rounds")), daemon=True).start()
         return self._send(200, {"job_id": jid})
 
+    def handle_station(self, body):
+        """The Station endpoint: one natural-language instruction -> forge a new app (empty
+        editor) or edit the current one, then run the verify loop. Returns a job id the UI
+        polls exactly like autoforge."""
+        instruction = (body.get("instruction") or body.get("description") or "").strip()
+        if not instruction:
+            return self._send(400, {"error": "tell me what to build or what to change"})
+        main_py = body.get("main_py") or ""
+        reqs = body.get("requirements", "python3,kivy")
+        perms = body.get("permissions", "")
+        jid = uuid.uuid4().hex[:12]
+        JOBS[jid] = {"status": "running", "steps": [], "round": 0, "payload": None}
+        threading.Thread(target=run_station,
+                         args=(jid, instruction, main_py, reqs, perms, body.get("rounds")),
+                         daemon=True).start()
+        return self._send(200, {"job_id": jid})
+
     def _keytest(self):
         """Diagnose a key by testing it TWO ways: curl and Python urllib.
         If curl works but Python doesn't, the bug is in our request construction.
@@ -3465,10 +3680,13 @@ class H(BaseHTTPRequestHandler):
         model = CONFIG.get("sf_model") or SF_MODEL
         url = chat_url(CONFIG.get("sf_url") or SF_URL)
         masked = key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
-        payload = json.dumps({
-            "model": model, "messages": [{"role": "user", "content": "say ok"}],
-            "temperature": 0, "max_tokens": 3,
-        })
+        # A thinking model spends output on reasoning before it can say "ok", so 3 tokens
+        # would come back empty (looks like a failure). Give it room and ask for minimal
+        # reasoning; reasoning_params is empty for a non-thinking model so this stays valid.
+        _body = {"model": model, "messages": [{"role": "user", "content": "say ok"}],
+                 "temperature": 0, "max_tokens": 64}
+        _body.update(reasoning_params(model, "low"))
+        payload = json.dumps(_body)
         diag = {"url": url, "model": model, "key_masked": masked,
                 "key_len": len(key), "key_prefix": key[:3]}
 
@@ -3995,7 +4213,7 @@ INDEX_HTML = r"""<!doctype html>
   .hdr-tools{display:flex;align-items:center;gap:8px}
 
   /* ---------- generic bits ---------- */
-  main{flex:1;display:grid;grid-template-columns:460px 1fr;min-height:0;max-width:none;margin:0;padding:0}
+  main{flex:1;display:grid;grid-template-columns:370px minmax(0,1fr) 400px;min-height:0;max-width:none;margin:0;padding:0}
   main>*{min-width:0;min-height:0}
   .panel{background:linear-gradient(180deg,var(--panel),var(--bg2));
     border:1px solid var(--line);border-radius:var(--r2);padding:18px;margin-bottom:18px;
@@ -4235,6 +4453,66 @@ INDEX_HTML = r"""<!doctype html>
   .dlg-h .t{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
   .work{overflow:auto;padding:16px}
   .dialogue .panel,.work .panel{box-shadow:none}
+  /* ===== the Station: full-width natural-language command bar ===== */
+  .station{flex:0 0 auto;padding:14px 18px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(232,163,61,.07),rgba(12,14,15,0))}
+  .station-h{display:flex;align-items:center;gap:11px;margin-bottom:9px;flex-wrap:wrap}
+  .station-badge{font-family:var(--mono);font-size:10px;letter-spacing:.18em;font-weight:700;
+    color:#1c1407;background:var(--amber);padding:3px 10px;border-radius:6px;
+    box-shadow:0 4px 14px -6px var(--greenGlow)}
+  .station-sub{color:var(--muted);font-size:12.5px}
+  .station textarea{width:100%;min-height:56px;background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line2);border-radius:var(--r2);padding:12px 14px;
+    font-family:var(--mono);font-size:13px;line-height:1.5;resize:vertical;box-sizing:border-box}
+  .station textarea:focus{outline:none;border-color:var(--amber);
+    box-shadow:0 0 0 3px rgba(232,163,61,.14)}
+  button.big{font-size:14px;padding:11px 24px;font-weight:700}
+
+  /* ===== v4 three-zone shell: BUILD | THE APP | LIVE ACTIVITY ===== */
+  .zone{display:flex;flex-direction:column;min-height:0;overflow:auto;padding:16px;position:relative}
+  .zone.build{border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(16,19,21,.5),rgba(12,14,15,.3))}
+  .zone.activity{border-left:1px solid var(--line);background:linear-gradient(180deg,rgba(232,163,61,.035),rgba(12,14,15,.2))}
+  .zone.build .panel,.zone.app .panel,.zone.activity .panel{box-shadow:none}
+  /* a sticky, labelled header for each zone -- the "sections" */
+  .zone-h{position:sticky;top:-16px;z-index:9;margin:-16px -16px 14px;padding:13px 16px;
+    display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);
+    background:linear-gradient(180deg,rgba(15,20,22,.96),rgba(15,20,22,.72));
+    border-bottom:1px solid var(--line)}
+  .zone-h .zt{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--txt);font-weight:700}
+  .zone-h .zdot{width:7px;height:7px;border-radius:50%;background:var(--amber);
+    box-shadow:0 0 0 3px rgba(232,163,61,.16);flex:0 0 auto}
+  .zone-h .zsub{color:var(--dim);font-size:11px;margin-left:2px}
+  .zone-h .grow{flex:1}
+
+  /* the live activity feed fills its column and streams every action */
+  .zone.activity .rail{flex:1;max-height:none;margin-top:0;display:flex;flex-direction:column;
+    min-height:220px}
+  .stepr{position:relative;animation:actin .28s ease}
+  @keyframes actin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 2px rgba(232,163,61,.14)}50%{box-shadow:0 0 0 5px rgba(232,163,61,.28)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .stepr .ts{flex:0 0 auto;color:#4a5763;font-size:10.5px;margin-top:2px;font-variant-numeric:tabular-nums}
+  .stepr.run .ic{color:var(--amber);animation:spin 1s linear infinite;display:inline-block}
+  .stepr.run .tx{color:var(--txt)}
+  .stepr.head .tx{color:var(--amber);font-weight:700;letter-spacing:.02em}
+  .stepr.head{border-top:1px solid var(--line);margin-top:4px;padding-top:10px}
+  .rail .act-empty{padding:22px 16px;text-align:center;color:var(--dim);font-size:12.5px}
+  .zone.activity .bar{margin:12px 0 0}
+  /* build log tucked under the activity feed */
+  .zone.activity .log{height:200px;margin-top:0}
+  .zone.activity details{margin-top:14px}
+  .zone.activity summary{cursor:pointer;color:var(--muted);font-size:11px;font-weight:700;
+    letter-spacing:.12em;text-transform:uppercase;font-family:var(--mono);padding:4px 0}
+
+  @media(max-width:1180px){
+    main{grid-template-columns:1fr;overflow:auto}
+    .zone{overflow:visible}
+    .zone.build{border-right:0;border-bottom:1px solid var(--line)}
+    .zone.activity{border-left:0;border-top:1px solid var(--line)}
+    .zone.activity .rail{min-height:260px;max-height:420px}
+    .zone-h{position:static;top:auto}
+  }
 </style>
 </head>
 <body>
@@ -4245,7 +4523,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 <div class="top">
   <div class="logo"><img src="/icon.png" alt=""><span class="name"><b>Andro</b>Dawg</span></div>
-  <div class="tool-chip" id="toolChip"><span class="fn" id="fileName">untitled.py</span><span class="badge ver">v3.1</span><span class="badge testing">apk</span></div>
+  <div class="tool-chip" id="toolChip"><span class="fn" id="fileName">untitled.py</span><span class="badge ver">v4.0</span><span class="badge testing">apk</span></div>
   <span class="spacer"></span>
   <div class="docwrap">
     <span class="pill" id="docsum" onclick="toggleDoctor()"><span class="dot"></span>checking...</span>
@@ -4262,9 +4540,30 @@ INDEX_HTML = r"""<!doctype html>
   <span class="step" data-step="build"><i>4</i> build apk</span>
 </div>
 
+<div class="station" id="stationwrap">
+  <div class="station-h">
+    <span class="station-badge">STATION</span>
+    <span class="station-sub">Tell the Dawg what you want. It builds a new app &mdash; or updates &amp; fixes the one open below &mdash; then self-tests it for you.</span>
+  </div>
+  <textarea id="station" onkeydown="stationKey(event)" placeholder="e.g.  build a habit tracker with a weekly grid and a streak counter that survives a restart&#10;or, with an app already open:  add a dark mode toggle  /  make the buttons bigger  /  fix the crash when I rotate the screen"></textarea>
+  <div class="row" style="margin-top:12px;align-items:center">
+    <button class="primary big" id="stationBtn" onclick="runStation()">&#9654;&nbsp; Go</button>
+    <span class="hint">New app or a change to the current one &mdash; Ctrl+Enter to run. It builds &rarr; checks &rarr; self-tests &rarr; fixes on its own.</span>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <button class="chip" onclick="stationChip('Add a dark/light theme toggle that persists between launches')">&#9681; theme toggle</button>
+    <button class="chip" onclick="stationChip('Add a settings screen and save the preferences in user_data_dir')">&#9881;&#xFE0E; settings screen</button>
+    <button class="chip" onclick="stationChip('Add a high-score / stats screen that survives a restart')">&#9733; scores</button>
+    <button class="chip" onclick="stationChip('Add sound effects generated at runtime, no external files')">&#9834; sound</button>
+    <button class="chip" onclick="stationChip('Make the whole UI look more polished and modern: tighten spacing, hierarchy and touch targets')">&#10022; polish look</button>
+    <button class="chip" onclick="stationChip('Find and fix anything that stops it launching or crashes on a tap')">&#10003; find &amp; fix bugs</button>
+  </div>
+</div>
+
 <main>
- <div class="dialogue">
-  <div class="dlg-h"><span class="t">build request</span></div>
+ <div class="zone build">
+  <div class="zone-h"><span class="zdot"></span><span class="zt">Build</span><span class="zsub">describe it or hand-write it</span></div>
+  <p class="hint" style="margin:-4px 0 12px">The <b style="color:var(--amber)">Station</b> up top is the fast path &mdash; build or change an app in one line. These are the classic controls.</p>
   <div class="tabs">
     <div class="tab active" id="tab_ai" onclick="setMode('ai')">AI FORGE</div>
     <div class="tab" id="tab_manual" onclick="setMode('manual')">MANUAL</div>
@@ -4303,8 +4602,9 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  </div><!-- /dialogue -->
- <div class="work">
+  </div><!-- /zone build -->
+ <div class="zone app">
+  <div class="zone-h"><span class="zdot"></span><span class="zt">The App</span><span class="zsub" id="appSub">nothing forged yet</span><span class="grow"></span><span class="pill" id="kitpillTop"></span></div>
   <!-- ============ Workspace ============ -->
   <div class="panel hidden" id="out">
     <div class="notice hidden" id="crashbanner"></div>
@@ -4400,21 +4700,21 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <!-- ============ Agent panel ============ -->
-  <div class="panel hidden" id="agentwrap">
-    <div class="sect"><h3>Forge &amp; verify</h3><span class="line"></span>
-      <span class="pill" id="agentstat"></span></div>
-    <div class="rail" id="rail"></div>
-    <div class="bar hidden" id="agentbar"><i></i></div>
-  </div>
+ </div><!-- /zone app -->
 
-  <!-- ============ Build log ============ -->
-  <div class="panel hidden" id="logwrap">
-    <div class="sect"><h3>Build log</h3><span class="line"></span>
+ <!-- ============ Live Activity (always on) ============ -->
+ <aside class="zone activity">
+  <div class="zone-h"><span class="zdot" id="actDot"></span><span class="zt">Live Activity</span><span class="grow"></span><span class="pill" id="agentstat">idle</span></div>
+  <div class="bar hidden" id="agentbar"><i></i></div>
+  <div class="rail" id="rail"><div class="act-empty">Everything the Dawg does shows up here, live &mdash; forging, checking, self-testing, fixing and building. Give it something to do above.</div></div>
+  <span id="agentwrap" hidden></span>
+  <details id="logwrap" class="hidden">
+    <summary>Build log</summary>
+    <div class="sect" style="margin-top:12px"><span class="line"></span>
       <button id="apkBtn" class="accent sm hidden" onclick="downloadApk()">&#8595; Download APK</button></div>
     <div class="log" id="log"></div>
-  </div>
- </div><!-- /work -->
+  </details>
+ </aside>
 </main>
 
 <!-- ============ Settings ============ -->
@@ -4431,13 +4731,19 @@ INDEX_HTML = r"""<!doctype html>
     <div class="field">
       <label>Model</label>
       <select id="sf_model_sel" onchange="onModelChange()">
-        <option value="deepseek-ai/DeepSeek-V4-Pro">deepseek-ai/DeepSeek-V4-Pro</option>
-        <option value="deepseek-ai/DeepSeek-V4-Flash">deepseek-ai/DeepSeek-V4-Flash (cheaper)</option>
-        <option value="deepseek-ai/DeepSeek-V3">deepseek-ai/DeepSeek-V3</option>
-        <option value="Qwen/Qwen2.5-Coder-32B-Instruct">Qwen/Qwen2.5-Coder-32B-Instruct</option>
+        <option value="zai-org/GLM-5.3-Flash">zai-org/GLM-5.3-Flash (default)</option>
         <option value="__custom__">custom...</option>
       </select>
       <input type="text" id="sf_model_custom" class="hidden" placeholder="provider/model" style="margin-top:8px">
+      <p class="msub" id="glm_note" style="margin-top:8px">GLM-5.3-Flash always reasons before it writes &mdash; that reasoning is stripped automatically so it never lands in your app. Set how hard it thinks below.</p>
+    </div>
+    <div class="field" id="reasoning_field">
+      <label>Reasoning effort <span class="sub">(GLM only)</span></label>
+      <select id="reasoning_effort">
+        <option value="low">low &mdash; fastest &amp; cheapest, best for code (default)</option>
+        <option value="high">high &mdash; more planning on tricky apps</option>
+        <option value="max">max &mdash; deepest, slowest, most expensive</option>
+      </select>
     </div>
 
     <details open>
@@ -4497,6 +4803,43 @@ function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,function(c){
 function show(id){$(id).classList.remove('hidden');}
 function hide(id){$(id).classList.add('hidden');}
 
+/* ---------------------------------------------------------------- live activity feed */
+var ACTICON={ok:'✓', fail:'✗', warn:'!', step:'›', run:'◐', info:'·', head:'▸'};
+function actTime(){ var d=new Date(); function p(n){return (n<10?'0':'')+n;}
+  return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds()); }
+/* Append one row to the always-on feed. kind: run|ok|fail|warn|step|info|head.
+   Returns the row so a 'run' line can be resolved in place with actEnd(). */
+function logAct(text, kind){
+  kind=kind||'info';
+  var rail=$('rail'); if(!rail) return null;
+  var e=rail.querySelector('.act-empty'); if(e) e.remove();
+  var row=document.createElement('div');
+  row.className='stepr '+kind;
+  row.innerHTML='<div class="ic">'+(ACTICON[kind]||'·')+'</div>'+
+    '<div class="tx"></div><div class="ts">'+actTime()+'</div>';
+  row.querySelector('.tx').textContent=text;
+  rail.appendChild(row);
+  while(rail.children.length>260) rail.removeChild(rail.firstChild);
+  rail.scrollTop=rail.scrollHeight;
+  return row;
+}
+/* Resolve a running row (or append a fresh one if it's gone). */
+function actEnd(row, text, kind){
+  kind=kind||'ok';
+  if(!row || !row.parentNode) return logAct(text, kind);
+  row.className='stepr '+kind;
+  row.querySelector('.ic').textContent=ACTICON[kind]||'✓';
+  if(text!=null) row.querySelector('.tx').textContent=text;
+  row.querySelector('.ts').textContent=actTime();
+  var rail=$('rail'); if(rail) rail.scrollTop=rail.scrollHeight;
+  return row;
+}
+function actHead(text){ return logAct(text, 'head'); }
+function setActStatus(txt, running){
+  var s=$('agentstat'); if(s) s.textContent=txt;
+  var d=$('actDot'); if(d) d.style.animation = running ? 'pulse 1.1s ease-in-out infinite' : '';
+}
+
 /* ---------------------------------------------------------------- toasts */
 function toast(msg, kind){
   var d=document.createElement('div');
@@ -4506,6 +4849,8 @@ function toast(msg, kind){
   setTimeout(function(){ d.style.transition='opacity .3s, transform .3s';
     d.style.opacity='0'; d.style.transform='translateX(20px)';
     setTimeout(function(){d.remove();},320); }, kind==='bad'?6500:3600);
+  // every toast is also a permanent line in the activity stream
+  logAct(msg, {ok:'ok', bad:'fail', warn:'warn'}[kind] || 'info');
 }
 
 /* ---------------------------------------------------------------- busy state */
@@ -4513,7 +4858,12 @@ function busy(btn, label){
   var b=$(btn); if(!b) return function(){};
   var old=b.innerHTML; b.disabled=true;
   b.innerHTML='<span class="spin"></span> '+label;
-  return function(){ b.disabled=false; b.innerHTML=old; refreshButtons(); };
+  // narrate the start of the action in the live feed
+  var row=logAct((label||'working')+'…', 'run');
+  setActStatus(label||'working', true);
+  return function(){ b.disabled=false; b.innerHTML=old; refreshButtons();
+    if(row && row.classList.contains('run')){ row.remove(); }
+    setActStatus('idle', false); };
 }
 
 /* ---------------------------------------------------------------- mode */
@@ -4584,6 +4934,10 @@ function metaTags(p){
     : 'UI kit: lines 1&ndash;'+(p.kit_lines||0)+' <b>locked</b>';
   $('kitBtn').textContent = (p.kit===false) ? '+ Add UI kit' : '\u2212 Remove UI kit';
   useKit = (p.kit!==false);
+  // mirror status into the zone header
+  var kt=$('kitpillTop'); if(kt) kt.innerHTML=(p.syntax_ok?'<span class="dot"></span>syntax ok':'<span class="dot"></span>syntax error');
+  if(kt) kt.className='pill '+(p.syntax_ok?'ok':'bad');
+  var sub=$('appSub'); if(sub) sub.textContent=(p.title||p.name) ? (p.title||p.name) : 'untitled app';
 }
 
 function renderValidation(p){
@@ -4769,10 +5123,9 @@ async function autoForge(){
   var desc=$('desc').value.trim();
   if(!desc && !(cur&&cur.main_py)){ $('desc').focus(); return; }
   if(desc) turns.push(desc);
-  var done=busy('autoBtn','running');
-  show('agentwrap'); show('agentbar');
-  $('rail').innerHTML=''; $('agentstat').textContent='starting';
-  $('agentwrap').scrollIntoView({behavior:'smooth',block:'nearest'});
+  var done=busy('autoBtn','forge & verify');
+  actHead(desc ? ('Forge & verify — '+desc.slice(0,80)) : 'Forge & verify — current app');
+  show('agentbar');
   try{
     var body={description:desc};
     if(!desc && cur){ collect(); body.main_py=cur.main_py; body.name=cur.name;
@@ -4786,7 +5139,30 @@ async function autoForge(){
   }catch(e){ toast('network: '+e,'bad'); done(); hide('agentbar'); }
 }
 
-var ICONS={ok:'\u2713', fail:'\u2717', warn:'!', step:'\u203A', info:'\u00B7'};
+/* ---- THE STATION: one box that builds a new app or edits the current one ---- */
+function stationKey(e){ if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); runStation(); } }
+function stationChip(t){ $('station').value=t; $('station').focus(); }
+async function runStation(){
+  var ins=$('station').value.trim();
+  if(!ins){ $('station').focus(); return; }
+  var done=busy('stationBtn','station');
+  actHead('Station — '+ins.slice(0,90));
+  show('agentbar');
+  try{
+    var body={instruction:ins};
+    // If there's an app open, hand it over so the Station EDITS it instead of starting fresh.
+    if(cur && (cur.main_py||$('code').value)){ collect();
+      body.main_py=cur.main_py; body.requirements=cur.requirements; body.permissions=cur.permissions; }
+    var r=await fetch('/api/station',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    var d=await r.json();
+    if(!r.ok){ toast(d.error||'could not start','bad'); done(); hide('agentbar'); return; }
+    turns.push(ins);
+    $('station').value='';
+    pollJob(d.job_id, done);
+  }catch(e){ toast('network: '+e,'bad'); done(); hide('agentbar'); }
+}
+
 function pollJob(jid, done){
   if(jobT) clearInterval(jobT);
   var seen=0;
@@ -4794,23 +5170,17 @@ function pollJob(jid, done){
     try{
       var r=await fetch('/api/job?id='+jid); var d=await r.json();
       var steps=d.steps||[];
-      if(steps.length!==seen){
-        $('rail').innerHTML=steps.map(function(s){
-          return '<div class="stepr '+(s.kind||'info')+'"><div class="ic">'+
-            (ICONS[s.kind]||'\u00B7')+'</div><div class="tx">'+esc(s.text)+'</div></div>';
-        }).join('');
-        $('rail').scrollTop=$('rail').scrollHeight;
-        seen=steps.length;
-      }
-      $('agentstat').textContent = d.status==='running'
-        ? ('round '+(d.round||1)) : d.status;
+      // append only the NEW steps, so job progress interleaves into the one live feed
+      for(var i=seen;i<steps.length;i++){ logAct(steps[i].text, steps[i].kind||'info'); }
+      seen=steps.length;
+      setActStatus(d.status==='running' ? ('round '+(d.round||1)) : d.status, d.status==='running');
       updateUsage(d.usage);
       if(d.phases && d.phases.length) renderPhases(d.phases);
       if(d.status!=='running'){
         clearInterval(jobT); jobT=null; hide('agentbar');
         if(d.payload) render(d.payload);
         if(d.status==='done') toast('verified \u2014 self-test passed, ready to build','ok');
-        else if(d.status==='stalled') toast('stopped early to save tokens \u2014 see the rail','warn');
+        else if(d.status==='stalled') toast('stopped early to save tokens \u2014 see the activity feed','warn');
         else toast(d.error||'the run failed','bad');
         done();
       }
@@ -5030,7 +5400,8 @@ async function buildApk(force){
       return;
     }
     if(!r.ok){ toast(d.error||'build refused','bad'); done(); return; }
-    show('logwrap'); $('log').textContent='crash check passed \u2014 build started ('+d.build_id+')...\n';
+    show('logwrap'); $('logwrap').open=true;
+    $('log').textContent='crash check passed \u2014 build started ('+d.build_id+')...\n';
     $('logwrap').scrollIntoView({behavior:'smooth',block:'nearest'});
     pollBuild(d.build_id, done);
   }catch(e){ toast('network: '+e,'bad'); done(); }
@@ -5159,6 +5530,7 @@ async function openSettings(){
     if(d.groq_url) $('groq_url').value=d.groq_url;
     $('max_tokens').value=d.max_tokens; $('token_budget').value=d.token_budget;
     $('agent_rounds').value=d.agent_rounds;
+    if(d.reasoning_effort) $('reasoning_effort').value=d.reasoning_effort;
     $('cache').checked=!!d.cache; $('auto_repair').checked=!!d.auto_repair;
     $('sf_key').value=''; $('groq_key').value='';
     $('clear_sf').checked=false; $('clear_groq').checked=false;
@@ -5205,9 +5577,10 @@ async function saveSettings(silent){
   var body={sf_key:$('sf_key').value, groq_key:$('groq_key').value, sf_model:model,
     sf_url:$('sf_url').value, groq_model:$('groq_model').value, groq_url:$('groq_url').value,
     clear_sf:$('clear_sf').checked, clear_groq:$('clear_groq').checked,
-    max_tokens:parseInt($('max_tokens').value||'12000',10),
+    max_tokens:parseInt($('max_tokens').value||'20000',10),
     token_budget:parseInt($('token_budget').value||'0',10),
     agent_rounds:parseInt($('agent_rounds').value||'3',10),
+    reasoning_effort:$('reasoning_effort').value,
     cache:$('cache').checked, auto_repair:$('auto_repair').checked};
   try{
     var r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},

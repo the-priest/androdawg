@@ -30,6 +30,16 @@ feeds the real traceback back and fixes it, before you ever spend 40 minutes on 
 
 Everything runs **locally**. Your API key never leaves your machine.
 
+**The Station** (v4.0) is the front door: one command box at the top of the window. Type
+what you want in plain English — *"build a habit tracker with a weekly grid"* on an empty
+editor, or *"add a dark mode toggle" / "make the buttons bigger" / "fix the crash on
+rotate"* with an app already open — hit **Go**, and it builds or edits, then runs the whole
+forge → repair → self-test → fix loop on its own. No mode-juggling.
+
+Powered by **GLM-5.3-Flash**. It's an always-reasoning model, so AndroDawg asks for minimal
+reasoning (to spend budget on code, not planning) and strips the chain-of-thought before it
+can ever leak into your app — you can dial the effort up in Settings for tricky builds.
+
 <br>
 
 <table>
