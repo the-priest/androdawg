@@ -4225,7 +4225,7 @@ INDEX_HTML = r"""<!doctype html>
   .hdr-tools{display:flex;align-items:center;gap:8px}
 
   /* ---------- generic bits ---------- */
-  main{flex:1;display:grid;grid-template-columns:370px minmax(0,1fr) 400px;min-height:0;max-width:none;margin:0;padding:0}
+  main{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 400px;min-height:0;max-width:none;margin:0;padding:0}
   main>*{min-width:0;min-height:0}
   .panel{background:linear-gradient(180deg,var(--panel),var(--bg2));
     border:1px solid var(--line);border-radius:var(--r2);padding:18px;margin-bottom:18px;
@@ -4283,12 +4283,6 @@ INDEX_HTML = r"""<!doctype html>
   .notice.bad{border-left-color:var(--danger);background:linear-gradient(180deg,rgba(224,89,74,.08),transparent)}
 
   /* ---------- tabs ---------- */
-  .tabs{display:inline-flex;gap:4px;padding:4px;background:var(--panel);
-    border:1px solid var(--line);border-radius:13px;margin-bottom:18px}
-  .tab{padding:8px 20px;border-radius:9px;color:var(--muted);cursor:pointer;
-    font-weight:600;font-size:13px;transition:.15s;user-select:none;letter-spacing:.3px}
-  .tab:hover{color:var(--txt)}
-  .tab.active{color:#1c1407;background:var(--amber);box-shadow:0 4px 14px -6px var(--greenGlow);font-weight:700}
 
   /* ---------- status pills ---------- */
   .pills{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
@@ -4448,23 +4442,6 @@ INDEX_HTML = r"""<!doctype html>
   .icon-btn{background:var(--panel);border:1px solid var(--line);border-radius:var(--r2);color:var(--muted);
     width:34px;height:34px;padding:0;cursor:pointer;font-size:15px;display:grid;place-items:center}
   .icon-btn:hover{color:var(--txt);border-color:var(--amber);background:rgba(232,163,61,.06);transform:none}
-  .steprail{display:flex;align-items:center;gap:8px;padding:8px 16px;flex:0 0 auto;
-    background:linear-gradient(180deg,rgba(15,20,22,.92),rgba(12,15,16,.55));border-bottom:1px solid var(--line)}
-  .steprail .step{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10px;
-    letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
-  .steprail .step i{display:grid;place-items:center;width:16px;height:16px;border-radius:50%;
-    border:1px solid var(--line);font-style:normal;font-size:9px;font-weight:700;color:var(--dim);background:var(--panel)}
-  .steprail .step.on{color:var(--amber)}
-  .steprail .step.on i{border-color:var(--amber);color:#1c1407;background:var(--amber);box-shadow:0 0 0 3px rgba(232,163,61,.16)}
-  .steprail .step.done{color:var(--lime)}
-  .steprail .step.done i{border-color:var(--lime);color:#11210a;background:var(--lime)}
-  .steprail .sep{flex:0 1 26px;height:1px;background:var(--line)}
-  .dialogue{display:flex;flex-direction:column;overflow:auto;padding:16px;
-    border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(16,19,21,.5),rgba(12,14,15,.3))}
-  .dlg-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-  .dlg-h .t{font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
-  .work{overflow:auto;padding:16px}
-  .dialogue .panel,.work .panel{box-shadow:none}
   /* ===== the Station: full-width natural-language command bar ===== */
   .station{flex:0 0 auto;padding:14px 18px;border-bottom:1px solid var(--line);
     background:linear-gradient(180deg,rgba(232,163,61,.07),rgba(12,14,15,0))}
@@ -4482,9 +4459,8 @@ INDEX_HTML = r"""<!doctype html>
 
   /* ===== v4 three-zone shell: BUILD | THE APP | LIVE ACTIVITY ===== */
   .zone{display:flex;flex-direction:column;min-height:0;overflow:auto;padding:16px;position:relative}
-  .zone.build{border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(16,19,21,.5),rgba(12,14,15,.3))}
   .zone.activity{border-left:1px solid var(--line);background:linear-gradient(180deg,rgba(232,163,61,.035),rgba(12,14,15,.2))}
-  .zone.build .panel,.zone.app .panel,.zone.activity .panel{box-shadow:none}
+  .zone.app .panel,.zone.activity .panel{box-shadow:none}
   /* a sticky, labelled header for each zone -- the "sections" */
   .zone-h{position:sticky;top:-16px;z-index:9;margin:-16px -16px 14px;padding:13px 16px;
     display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);
@@ -4496,6 +4472,14 @@ INDEX_HTML = r"""<!doctype html>
     box-shadow:0 0 0 3px rgba(232,163,61,.16);flex:0 0 auto}
   .zone-h .zsub{color:var(--dim);font-size:11px;margin-left:2px}
   .zone-h .grow{flex:1}
+  .zone-h{flex-wrap:wrap}
+  /* slim hand-write toolbar under THE APP header */
+  .tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px;
+    padding-bottom:14px;border-bottom:1px solid var(--line)}
+  .tools .tlabel{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--dim);margin-right:2px}
+  select.sm,button.sm{font-size:11.5px;padding:6px 11px}
+  select.sm{max-width:190px;background-position:right 8px center}
 
   /* the live activity feed fills its column and streams every action */
   .zone.activity .rail{flex:1;max-height:none;margin-top:0;display:flex;flex-direction:column;
@@ -4520,7 +4504,6 @@ INDEX_HTML = r"""<!doctype html>
   @media(max-width:1180px){
     main{grid-template-columns:1fr;overflow:auto}
     .zone{overflow:visible}
-    .zone.build{border-right:0;border-bottom:1px solid var(--line)}
     .zone.activity{border-left:0;border-top:1px solid var(--line)}
     .zone.activity .rail{min-height:260px;max-height:420px}
     .zone-h{position:static;top:auto}
@@ -4545,13 +4528,6 @@ INDEX_HTML = r"""<!doctype html>
   <button class="icon-btn" onclick="openSettings()" title="Settings">&#9881;&#xFE0E;</button>
   <button class="icon-btn" onclick="quitApp()" title="Quit">&#9211;</button>
 </div>
-<div class="steprail" id="stepRail">
-  <span class="step on" data-step="describe"><i>1</i> describe</span><span class="sep"></span>
-  <span class="step" data-step="check"><i>2</i> crash-check</span><span class="sep"></span>
-  <span class="step" data-step="fix"><i>3</i> fix</span><span class="sep"></span>
-  <span class="step" data-step="build"><i>4</i> build apk</span>
-</div>
-
 <div class="station" id="stationwrap">
   <div class="station-h">
     <span class="station-badge">STATION</span>
@@ -4573,50 +4549,14 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <main>
- <div class="zone build">
-  <div class="zone-h"><span class="zdot"></span><span class="zt">Build</span><span class="zsub">describe it or hand-write it</span></div>
-  <p class="hint" style="margin:-4px 0 12px">The <b style="color:var(--amber)">Station</b> up top is the fast path &mdash; build or change an app in one line. These are the classic controls.</p>
-  <div class="tabs">
-    <div class="tab active" id="tab_ai" onclick="setMode('ai')">AI FORGE</div>
-    <div class="tab" id="tab_manual" onclick="setMode('manual')">MANUAL</div>
-  </div>
-
-  <!-- ============ AI panel ============ -->
-  <div class="panel" id="ai_panel">
-    <label>Describe the Android app you want
-      <span class="sub">&mdash; the UI kit, launcher icon and splash are added for you</span></label>
-    <textarea id="desc" placeholder="a dark pomodoro timer with start/pause, a circular countdown ring, and a session counter that survives a restart"></textarea>
-    <div class="row" style="margin-top:12px">
-      <button class="primary" id="forgeBtn" onclick="forge()">Forge app</button>
-      <button class="violet" id="autoBtn" onclick="autoForge()" title="forge, then check, self-test and fix until it passes">Forge &amp; verify</button>
-      <span class="hint">Ctrl+Enter to forge. <b style="color:var(--violet)">Forge &amp; verify</b> runs the whole loop: build &rarr; repair &rarr; self-test &rarr; fix.</span>
-    </div>
-    <div class="row" style="margin-top:12px">
-      <button class="chip" onclick="refine('Make it look more polished and modern: tighten the layout, spacing and hierarchy')">&#9733; polish look</button>
-      <button class="chip" onclick="refine('Add sound effects generated at runtime, no external files')">&#9834; add sound</button>
-      <button class="chip" onclick="refine('Add a settings screen and persist preferences in user_data_dir')">&#9881;&#xFE0E; add settings</button>
-      <button class="chip" onclick="refine('Add a high score / stats screen saved between launches')">&#9733; add scores</button>
-      <button class="chip" onclick="refine('Add a dark/light theme toggle that persists')">&#9681; theme toggle</button>
-    </div>
-  </div>
-
-  <!-- ============ Manual panel ============ -->
-  <div class="panel hidden" id="manual_panel">
-    <div class="sect"><h3>Manual mode</h3><span class="line"></span></div>
-    <p class="hint" style="margin-bottom:14px">
-      The editor is empty and the file is exactly what you type &mdash; no kit, no scaffold.
-      Add the Dawg UI kit or drop in a starter only if you want one.</p>
-    <div class="row">
-      <select id="tpl_sel" style="max-width:340px"></select>
-      <button onclick="loadTemplate()">Insert starter</button>
-      <button class="ghost" onclick="toggleKit()" id="kitBtn">+ Add UI kit</button>
-      <button class="ghost" onclick="newBlank()">Clear</button>
-    </div>
-  </div>
-
-  </div><!-- /zone build -->
  <div class="zone app">
-  <div class="zone-h"><span class="zdot"></span><span class="zt">The App</span><span class="zsub" id="appSub">nothing forged yet</span><span class="grow"></span><span class="pill" id="kitpillTop"></span></div>
+  <div class="zone-h"><span class="zdot"></span><span class="zt">The App</span><span class="zsub" id="appSub">nothing open yet</span><span class="grow"></span><button class="ghost sm" onclick="newBlank()" title="Empty the editor — hand-write, or start a brand-new app for the Station">+ New file</button></div>
+  <div class="tools">
+    <span class="tlabel">hand-write</span>
+    <select id="tpl_sel" class="sm"></select>
+    <button class="ghost sm" onclick="loadTemplate()">Insert starter</button>
+    <button class="ghost sm" onclick="toggleKit()" id="kitBtn">+ Add UI kit</button>
+  </div>
   <!-- ============ Workspace ============ -->
   <div class="panel hidden" id="out">
     <div class="notice hidden" id="crashbanner"></div>
@@ -4668,21 +4608,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="log" id="testout" style="margin-top:12px"></div>
     </div>
 
-    <div class="sect" style="margin-top:22px"><h3>Improve with AI</h3><span class="line"></span></div>
-    <p class="hint" style="margin:-4px 0 12px">Keep talking to the AI to change this app &mdash; it sees the current code and edits it, it doesn't start over.</p>
-    <div class="row">
-      <input type="text" id="improveText" style="flex:1;min-width:240px"
-             placeholder="e.g. add a reset button, make the timer bigger, save history between launches"
-             onkeydown="if(event.key==='Enter'){event.preventDefault();improve();}">
-      <button class="primary" id="improveBtn" onclick="improve()">Update with AI</button>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button class="chip" onclick="improveWith('Make it look more polished and modern: tighten layout, spacing and hierarchy')">&#9733; polish look</button>
-      <button class="chip" onclick="improveWith('Add a settings screen and persist preferences in user_data_dir')">&#9881;&#xFE0E; add settings</button>
-      <button class="chip" onclick="improveWith('Add a dark/light theme toggle that persists')">&#9681; theme toggle</button>
-      <button class="chip" onclick="improveWith('Add helpful animations and tap feedback throughout')">&#9834; add motion</button>
-    </div>
-    <div class="notice bad hidden" id="aiErr" style="margin-top:12px"></div>
+    <p class="hint" style="margin:18px 0 0">To change this app, type it in the <b style="color:var(--amber)">Station</b> up top &mdash; e.g. <i>&ldquo;add a reset button&rdquo;</i> or <i>&ldquo;fix the crash on rotate&rdquo;</i>. It edits the code below in place.</p>
 
     <div class="actions">
       <button class="accent" id="buildBtn" onclick="buildApk()" title="launches the app and taps every button first; refuses to build a crasher">Build APK</button>
@@ -4701,9 +4627,9 @@ INDEX_HTML = r"""<!doctype html>
     <div class="empty">
       <img src="/icon.png" alt="" style="width:64px;height:64px;border-radius:16px;opacity:.9;margin-bottom:14px;box-shadow:0 0 0 1px var(--greenGlow),0 10px 30px -10px var(--greenGlow)">
       <div style="color:var(--txt);font-size:16px;font-weight:700;margin-bottom:6px">Let the Dawg forge it</div>
-      <div style="max-width:520px;margin:0 auto;color:var(--muted)">Describe an app above, or switch to
-        <b style="color:var(--green);cursor:pointer" onclick="setMode('manual')">MANUAL</b>
-        to write it yourself in an empty file.</div>
+      <div style="max-width:520px;margin:0 auto;color:var(--muted)">Describe an app in the <b style="color:var(--amber)">Station</b> up top, or hit
+        <b style="color:var(--amber);cursor:pointer" onclick="newBlank()">+ New file</b>
+        to write one yourself.</div>
       <div class="pills" style="justify-content:center;margin-top:20px">
         <span class="pill info">static-checked before it can build</span>
         <span class="pill info">actually launched &amp; every button tapped</span>
@@ -4804,7 +4730,6 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 var cur = null;          // current payload
 var turns = [];          // short user turns only -- never full responses (token discipline)
-var mode = 'ai';
 var pollT = null, testT = null, jobT = null;
 var lintT = null;
 var useKit = false;      // manual mode starts with no kit at all
@@ -4882,17 +4807,8 @@ function busy(btn, label){
     setActStatus('idle', false); };
 }
 
-/* ---------------------------------------------------------------- mode */
-function setMode(m){
-  mode=m;
-  $('tab_ai').classList.toggle('active', m==='ai');
-  $('tab_manual').classList.toggle('active', m==='manual');
-  $('ai_panel').classList.toggle('hidden', m!=='ai');
-  $('manual_panel').classList.toggle('hidden', m!=='manual');
-  if(m==='manual' && !cur){ newBlank(); }
-}
-
-/* Manual mode opens a genuinely empty file: no kit, no scaffold, nothing to delete. */
+/* Start a genuinely empty file: no kit, no scaffold, nothing to delete. Also the way to
+   begin a NEW app while one is open -- clears the editor so the Station forges fresh. */
 function newBlank(){
   useKit=false;
   cur={ok:true, name:'', title:'', orientation:'portrait', permissions:'',
@@ -4950,9 +4866,6 @@ function metaTags(p){
     : 'UI kit: lines 1&ndash;'+(p.kit_lines||0)+' <b>locked</b>';
   $('kitBtn').textContent = (p.kit===false) ? '+ Add UI kit' : '\u2212 Remove UI kit';
   useKit = (p.kit!==false);
-  // mirror status into the zone header
-  var kt=$('kitpillTop'); if(kt) kt.innerHTML=(p.syntax_ok?'<span class="dot"></span>syntax ok':'<span class="dot"></span>syntax error');
-  if(kt) kt.className='pill '+(p.syntax_ok?'ok':'bad');
   var sub=$('appSub'); if(sub) sub.textContent=(p.title||p.name) ? (p.title||p.name) : 'untitled app';
 }
 
@@ -5068,92 +4981,10 @@ async function runLint(){
   }catch(e){ $('livelint').textContent=''; }
 }
 
-/* ---------------------------------------------------------------- AI actions */
-function refine(text){
-  if(!cur || !(cur.main_py||'').trim()){
-    $('desc').value=(($('desc').value||'')+' '+text).trim(); $('desc').focus(); return;
-  }
-  $('desc').value=text;
-  forge();
-}
-
-function showAiErr(msg){
-  var el=$('aiErr');
-  if(!el){ toast(msg,'bad'); return; }
-  el.className='notice bad'; el.textContent='AI: '+msg; el.classList.remove('hidden');
-}
-
-function improveWith(text){ $('improveText').value=text; improve(); }
-
-/* Talk to the AI to change the CURRENT app -- it gets the existing code as context and
-   edits it in place. This is the in-workspace iterate loop; it never starts from scratch. */
-async function improve(){
-  if(!cur){ toast('forge or write an app first','warn'); return; }
-  var text=($('improveText').value||'').trim();
-  if(!text){ $('improveText').focus(); return; }
-  collect();
-  var el=$('aiErr'); if(el) el.classList.add('hidden');
-  var done=busy('improveBtn','asking the AI');
-  turns.push(text);
-  try{
-    var r=await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({description:text,
-        history:turns.slice(0,-1).map(function(t){return {role:'user',content:t};}),
-        main_py:cur.main_py||''})});
-    var d=await r.json();
-    if(!r.ok || !d || !d.ok){
-      // Show WHY, and keep it on screen -- a follow-up that fails (bad key, provider down,
-      // the model replied in prose instead of code) must not just flash a toast and vanish.
-      var msg=(d&&d.error)||('the AI call failed ('+r.status+')');
-      showAiErr(msg + '  \u2014 your current app is unchanged; edit the wording and try again.');
-      return;
-    }
-    d.name=cur.name||d.name; d.title=cur.title||d.title;   // keep identity across edits
-    render(d);
-    $('improveText').value='';
-    toast('updated \u2014 re-run Self-test or Preview to check','ok');
-  }catch(e){ showAiErr('network error: '+e); }
-  finally{ done(); }
-}
-
-async function forge(){
-  var desc=$('desc').value.trim();
-  if(!desc){ $('desc').focus(); return; }
-  var done=busy('forgeBtn','forging');
-  turns.push(desc);
-  try{
-    var r=await fetch('/api/forge',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({description:desc,
-        history:turns.slice(0,-1).map(function(t){return {role:'user',content:t};}),
-        main_py:(cur&&cur.main_py)||''})});
-    var d=await r.json();
-    if(!r.ok){ toast(d.error||('forge failed ('+r.status+')'),'bad'); return; }
-    render(d);
-    toast('forged "'+(d.title||d.name)+'"','ok');
-  }catch(e){ toast('network: '+e,'bad'); }
-  finally{ done(); }
-}
-
-/* The whole pipeline: forge -> free repair -> static gate -> self-test -> fix -> repeat. */
-async function autoForge(){
-  var desc=$('desc').value.trim();
-  if(!desc && !(cur&&cur.main_py)){ $('desc').focus(); return; }
-  if(desc) turns.push(desc);
-  actHead(desc ? ('Forge & verify — '+desc.slice(0,80)) : 'Forge & verify — current app');
-  var done=busy('autoBtn','forge & verify');
-  show('agentbar');
-  try{
-    var body={description:desc};
-    if(!desc && cur){ collect(); body.main_py=cur.main_py; body.name=cur.name;
-      body.title=cur.title; body.requirements=cur.requirements;
-      body.permissions=cur.permissions; body.orientation=cur.orientation; }
-    var r=await fetch('/api/autoforge',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(body)});
-    var d=await r.json();
-    if(!r.ok){ toast(d.error||'could not start','bad'); done(); hide('agentbar'); return; }
-    pollJob(d.job_id, done);
-  }catch(e){ toast('network: '+e,'bad'); done(); hide('agentbar'); }
-}
+/* (Removed in v4.0 cleanup: refine/showAiErr/improveWith/improve and the classic
+   forge/autoForge. The Station up top now owns BOTH paths -- forge a new app from an
+   empty editor, or edit the open one -- and always runs the verify loop, so these were
+   pure duplication.) */
 
 /* ---- THE STATION: one box that builds a new app or edits the current one ---- */
 function stationKey(e){ if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){ e.preventDefault(); runStation(); } }
@@ -5622,8 +5453,6 @@ async function quitApp(){
 }
 
 /* ---------------------------------------------------------------- wiring */
-$('desc').addEventListener('keydown', function(e){
-  if((e.ctrlKey||e.metaKey)&&e.key==='Enter') forge(); });
 $('code').addEventListener('input', function(){ syncGutter(); scheduleLint(); refreshButtons(); });
 $('code').addEventListener('scroll', function(){ $('gutter').scrollTop=this.scrollTop; });
 $('code').addEventListener('keydown', function(e){

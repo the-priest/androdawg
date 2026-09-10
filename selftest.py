@@ -846,7 +846,10 @@ def run_v3_endpoints():
         # the UI must actually reference every route it calls
         s, html = http_raw("GET", base + "/")
         page = html.decode()
-        for route in ("/api/lint", "/api/repair", "/api/autoforge", "/api/usage",
+        # v4: the Station replaced the separate Forge/Forge&verify buttons, so the UI drives
+        # the forge+verify loop through /api/station (the /api/autoforge endpoint still exists
+        # and is exercised directly above, it's just no longer wired to a button).
+        for route in ("/api/lint", "/api/repair", "/api/station", "/api/usage",
                       "/api/manual", "/api/job", "/api/cache_clear"):
             check("UI wires up %s" % route, route in page)
     finally:

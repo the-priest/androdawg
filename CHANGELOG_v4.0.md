@@ -108,12 +108,36 @@ Keeps the amber "Dawg" identity and every existing element id/handler.
   now leads the run spinner (was appearing above it); feed capped at 260 rows; XSS-safe rows
   (textContent, not innerHTML).
 
+## 5. Minimal redesign — cut the redundancy
+
+With the Station owning both forging (empty editor) and editing (open app) and always running
+the verify loop, three whole blocks were doing its job twice. All removed:
+
+- **The "AI Forge / Manual" left column** — the describe box, the Forge / Forge&verify buttons
+  and their chip row. The Station replaces them. Hand-writing survives as a slim toolbar in
+  THE APP header: **+ New file**, a template picker, **Insert starter**, **+ Add UI kit**.
+- **The "Improve with AI" block** in the workspace — pure duplication of the Station's edit
+  path; now a one-line pointer to the Station.
+- **The decorative step-rail** (describe → crash-check → fix → build) — it was never wired to
+  anything, just chrome. Gone.
+
+Layout went from three columns to a cleaner **two** — a wide **THE APP** workspace and the
+**LIVE ACTIVITY** stream — so the editor and meta breathe. Dead JS (`forge`, `autoForge`,
+`refine`, `improve`, `improveWith`, `showAiErr`, `setMode`, the `mode` var) and dead CSS
+(`.tabs/.tab`, `.steprail`, `.dialogue/.work/.dlg-h`, `.zone.build`) deleted. Every remaining
+capability is intact — forge, edit, manual, templates, kit, self-test, auto-fix, repair,
+polish, preview, build, download. The `/api/autoforge` endpoint stays (still tested directly);
+it's just no longer wired to a button, so the one UI-wiring test now checks `/api/station`.
+
 ## Verified
 
-- `selftest.py` **336/336** and `selftest_modules.py` **51/51** green, no test edits.
+- `selftest.py` **336/336** and `selftest_modules.py` **51/51** green (one UI-wiring assertion
+  updated from `/api/autoforge` to `/api/station` to match the Station replacing that button).
 - Review-pass fixes unit-tested: reasoning budgets all sit under `max_tokens`; the key-test
   payload carries no reasoning params; the silent-retry merges the nudge into the last user
   turn without adding a message or mutating the caller's list, and still recovers the app.
+- Redesign checked in a real browser (idle + live run): 2-column layout renders, the hand-write
+  toolbar works, no dangling refs to removed elements, JS parses, every handler/id resolves.
 - New GLM logic unit-tested: `strip_think` across all four shapes incl. the in-code
   `</think>` false-positive guard; `content_of`; `reasoning_params` per family; payload
   parsing through a think block.
