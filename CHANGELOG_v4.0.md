@@ -89,9 +89,31 @@ replacing a separate rail. Sticky section headers, a running status pill + pulse
 responsive stack that collapses to one column under 1180px (the desktop app runs it wide).
 Keeps the amber "Dawg" identity and every existing element id/handler.
 
+## 4. Review pass — bugs & inconsistencies fixed
+
+- **Key-test could cry failure on a working key.** The `/api/keytest` probe was sending the
+  GLM reasoning params, but — unlike `call_ai` — it has no 400 strip-and-retry, so a backend
+  that rejected those keys would report the key/model broken while forging (which retries)
+  worked fine. It's an auth/connectivity probe: success is HTTP 200. Reasoning params dropped;
+  `max_tokens` stays generous (64) so an always-thinking model still returns 200.
+- **`thinking_budget` could exceed the whole output ceiling.** At `high`/`max` the budget
+  (8192 / 24576) was larger than the answer had room for under a 20000 `max_tokens` cap —
+  nonsense the backend can't honour. Rebalanced to 2048 / 6144 / 12288, always well under the
+  default ceiling so the app code always has room.
+- **Silent-retry no longer stacks two user turns.** The reasoned-silent recovery appended a
+  second `user` message; some chat templates expect strict role alternation. The "answer now"
+  nudge is now folded into the last user turn (on a copy — the caller's messages are left
+  untouched).
+- **Activity feed polish:** a `clear` control in the LIVE ACTIVITY header; the section header
+  now leads the run spinner (was appearing above it); feed capped at 260 rows; XSS-safe rows
+  (textContent, not innerHTML).
+
 ## Verified
 
 - `selftest.py` **336/336** and `selftest_modules.py` **51/51** green, no test edits.
+- Review-pass fixes unit-tested: reasoning budgets all sit under `max_tokens`; the key-test
+  payload carries no reasoning params; the silent-retry merges the nudge into the last user
+  turn without adding a message or mutating the caller's list, and still recovers the app.
 - New GLM logic unit-tested: `strip_think` across all four shapes incl. the in-code
   `</think>` false-positive guard; `content_of`; `reasoning_params` per family; payload
   parsing through a think block.

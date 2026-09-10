@@ -755,7 +755,10 @@ def reasoning_params(model, effort=None):
     eff = (effort or CONFIG.get("reasoning_effort") or "low").lower()
     if eff not in GLM_REASONING_EFFORTS:
         eff = "low"
-    budget = {"low": 2048, "high": 8192, "max": 24576}[eff]
+    # thinking_budget is a slice of the SAME output ceiling as the app itself, so it must
+    # leave room for the code. Keep it well under the default max_tokens (20000) even at
+    # 'max' -- a budget bigger than the whole ceiling is nonsense the backend can't honour.
+    budget = {"low": 2048, "high": 6144, "max": 12288}[eff]
     return {"reasoning_effort": eff, "enable_thinking": True, "thinking_budget": budget}
 
 
@@ -2330,10 +2333,18 @@ def call_ai(messages, temperature=0.4, max_tokens=None, label="call", no_cache=F
             if not text and "glm" in (model or "").lower():
                 # reasoned-silent: GLM spent the whole budget thinking and emitted no
                 # answer. Re-ask with minimal reasoning, more room, and an explicit
-                # "answer now" -- reproducing the identical request would only loop.
-                nudge = list(messages) + [{"role": "user",
-                    "content": "Output the required result now, in full. Do NOT think "
-                               "further -- write the answer directly."}]
+                # "answer now" -- reproducing the identical request would only loop. Fold
+                # the nudge INTO the last user turn rather than appending a second user
+                # message, so the role sequence the chat template expects stays intact.
+                nudge_txt = ("\n\nOutput the required result now, in full. Do NOT think "
+                             "further -- write the answer directly.")
+                nudge = [dict(m) for m in messages]
+                for m in reversed(nudge):
+                    if m.get("role") == "user":
+                        m["content"] = (m.get("content") or "") + nudge_txt
+                        break
+                else:
+                    nudge.append({"role": "user", "content": nudge_txt.strip()})
                 d = _chat_completion(sf_u, sf, model, nudge, temperature,
                                      min(32000, max(max_tokens, 24000)), effort="low")
                 text = content_of(d)
@@ -3680,12 +3691,13 @@ class H(BaseHTTPRequestHandler):
         model = CONFIG.get("sf_model") or SF_MODEL
         url = chat_url(CONFIG.get("sf_url") or SF_URL)
         masked = key[:6] + "..." + key[-4:] if len(key) > 12 else "***"
-        # A thinking model spends output on reasoning before it can say "ok", so 3 tokens
-        # would come back empty (looks like a failure). Give it room and ask for minimal
-        # reasoning; reasoning_params is empty for a non-thinking model so this stays valid.
+        # This is an AUTH/CONNECTIVITY probe: success is HTTP 200, nothing more. Deliberately
+        # NO reasoning params -- call_ai strips-and-retries them on a 400, but this probe does
+        # not, so sending them here could make the key test cry failure on a working key while
+        # forging succeeds. max_tokens is generous (64) only so an always-thinking model still
+        # returns 200 instead of stalling on a 3-token cap; the body text is never inspected.
         _body = {"model": model, "messages": [{"role": "user", "content": "say ok"}],
                  "temperature": 0, "max_tokens": 64}
-        _body.update(reasoning_params(model, "low"))
         payload = json.dumps(_body)
         diag = {"url": url, "model": model, "key_masked": masked,
                 "key_len": len(key), "key_prefix": key[:3]}
@@ -4704,7 +4716,7 @@ INDEX_HTML = r"""<!doctype html>
 
  <!-- ============ Live Activity (always on) ============ -->
  <aside class="zone activity">
-  <div class="zone-h"><span class="zdot" id="actDot"></span><span class="zt">Live Activity</span><span class="grow"></span><span class="pill" id="agentstat">idle</span></div>
+  <div class="zone-h"><span class="zdot" id="actDot"></span><span class="zt">Live Activity</span><span class="grow"></span><button class="ghost sm" onclick="clearAct()" title="Clear the activity log">clear</button><span class="pill" id="agentstat">idle</span></div>
   <div class="bar hidden" id="agentbar"><i></i></div>
   <div class="rail" id="rail"><div class="act-empty">Everything the Dawg does shows up here, live &mdash; forging, checking, self-testing, fixing and building. Give it something to do above.</div></div>
   <span id="agentwrap" hidden></span>
@@ -4835,6 +4847,10 @@ function actEnd(row, text, kind){
   return row;
 }
 function actHead(text){ return logAct(text, 'head'); }
+function clearAct(){
+  var rail=$('rail'); if(!rail) return;
+  rail.innerHTML='<div class="act-empty">Cleared. New activity shows up here as the Dawg works.</div>';
+}
 function setActStatus(txt, running){
   var s=$('agentstat'); if(s) s.textContent=txt;
   var d=$('actDot'); if(d) d.style.animation = running ? 'pulse 1.1s ease-in-out infinite' : '';
@@ -5123,8 +5139,8 @@ async function autoForge(){
   var desc=$('desc').value.trim();
   if(!desc && !(cur&&cur.main_py)){ $('desc').focus(); return; }
   if(desc) turns.push(desc);
-  var done=busy('autoBtn','forge & verify');
   actHead(desc ? ('Forge & verify — '+desc.slice(0,80)) : 'Forge & verify — current app');
+  var done=busy('autoBtn','forge & verify');
   show('agentbar');
   try{
     var body={description:desc};
@@ -5145,8 +5161,8 @@ function stationChip(t){ $('station').value=t; $('station').focus(); }
 async function runStation(){
   var ins=$('station').value.trim();
   if(!ins){ $('station').focus(); return; }
-  var done=busy('stationBtn','station');
   actHead('Station — '+ins.slice(0,90));
+  var done=busy('stationBtn','station');
   show('agentbar');
   try{
     var body={instruction:ins};
